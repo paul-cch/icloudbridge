@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - Reminders settings page no longer shows a stale "Missing Permissions" warning after access was granted in System Settings. The backend now queries macOS EventKit directly on each permissions check instead of relying solely on the cached `permissions.json` written by the Preflight window, so grants made after the last Preflight cycle are picked up immediately. Full Disk Access is live-probed the same way.
-- Scheduled syncs (interval and cron, any service) failed to fire and "Run Now" returned `Schedule X not found` whenever the user had changed `data_dir` via the config API after startup. The scheduler held DB handles built from the startup config while route handlers rebuilt theirs from the current config, so newly-created schedules landed in one SQLite file while the scheduler kept reading from another. The scheduler now refreshes its config and repoints its `SchedulesDB` / `SyncLogsDB` handles before every public operation, keeping it in sync with the routes.
+- Scheduled syncs (interval and cron, any service) failed to fire and "Run Now" returned `Schedule X not found` for users who had changed `data_dir` via the config API. The route handlers pick up the new path from the settings DB via `get_config()`, but the scheduler was still reading its startup config, so newly-created schedules landed in one SQLite file while the scheduler kept reading from another. The scheduler now queries the settings DB for the current config path and repoints its `SchedulesDB` / `SyncLogsDB` handles whenever `data_dir` drifts — before every public operation and at startup — keeping it in sync with the routes.
 
 ## [0.2.2] - 2026-03-09 — "Every Cloud Has a Silver Lining"
 

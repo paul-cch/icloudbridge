@@ -55,16 +55,28 @@ class SchedulerManager:
         return self._running
 
     async def _refresh_config(self) -> None:
-        """Reload configuration from disk and repoint DB handles if data_dir changed.
+        """Reload configuration and repoint DB handles if data_dir changed.
 
-        Saving config via the API can change ``data_dir`` at runtime. The
-        routes pick this up on their next call (the lru_cached config is
-        cleared on save), but the scheduler holds DB instances built at
-        startup. Without this re-pointing, the scheduler reads from the old
-        path, misses schedules the routes just wrote, and raises
+        When the user saves config with a new ``data_dir`` via the API, the
+        new path is stored in the settings DB (``set_config_path``) and the
+        routes pick it up through ``get_config()``. The scheduler was
+        initialized at startup with the old path, so we must query the
+        settings DB here — not ``self.config.general.config_file``, which
+        stays frozen at the startup path — to see what the routes see.
+        Without this, the scheduler keeps reading from the old schedules.db
+        while routes write to the new one, producing
         "Schedule X not found" on trigger/add.
         """
-        config_path = getattr(self.config.general, "config_file", None)
+        from icloudbridge.utils.settings_db import get_config_path
+
+        config_path: Path | None = None
+        try:
+            config_path = get_config_path()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to read stored config path: %s", exc)
+
+        if not config_path:
+            config_path = getattr(self.config.general, "config_file", None)
         if not config_path:
             config_path = self.config.default_config_path
 
@@ -92,6 +104,11 @@ class SchedulerManager:
         if self._running:
             logger.warning("Scheduler already running")
             return
+
+        # If the user changed data_dir in a prior session, the path this
+        # SchedulerManager was constructed with is stale. Refresh from the
+        # settings DB so we load schedules from the right place.
+        await self._refresh_config()
 
         # Initialize databases
         await self.schedules_db.initialize()
