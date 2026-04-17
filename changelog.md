@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.3] - 2026-04-17
+
+### Fixed
+- Reminders settings page no longer shows a stale "Missing Permissions" warning after access was granted in System Settings. The backend now queries macOS EventKit directly on each permissions check instead of relying solely on the cached `permissions.json` written by the Preflight window, so grants made after the last Preflight cycle are picked up immediately. Full Disk Access is live-probed the same way.
+
 ## [0.2.2] - 2026-03-09 — "Every Cloud Has a Silver Lining"
 
 ### Fixed

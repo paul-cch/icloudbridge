@@ -237,14 +237,55 @@ async def verify_setup(request: Request, config: ConfigDep) -> SetupVerification
     )
 
 
+def _check_reminders_live() -> bool | None:
+    """Query EventKit for the current Reminders authorization status.
+
+    Returns True if access is granted, False if explicitly denied/restricted,
+    or None when the result is indeterminate (e.g. EventKit unavailable,
+    permission not yet determined). Callers should treat None as "fall back
+    to the cached value from permissions.json".
+
+    EKAuthorizationStatus values: 0=notDetermined, 1=restricted, 2=denied,
+    3=authorized/fullAccess (reminders), 4=writeOnly (Sonoma calendar).
+    """
+    try:
+        from EventKit import EKEntityTypeReminder, EKEventStore
+    except ImportError:
+        return None
+    try:
+        status = EKEventStore.authorizationStatusForEntityType_(EKEntityTypeReminder)
+    except Exception as exc:
+        logger.warning("Live reminders permission check failed: %s", exc)
+        return None
+    if status == 0:
+        return None
+    return status in (3, 4)
+
+
+def _check_full_disk_access_live() -> bool | None:
+    """Probe Full Disk Access by attempting to read the Notes database.
+
+    Returns True/False when the probe succeeds or fails with a permission
+    error, or None if the Notes DB doesn't exist (can't probe).
+    """
+    notes_db = Path.home() / "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+    if not notes_db.exists():
+        return None
+    try:
+        with open(notes_db, "rb") as f:
+            f.read(1)
+        return True
+    except (PermissionError, OSError):
+        return False
+
+
 @router.get("/permissions", response_model=PermissionsResponse)
 async def get_permissions(config: ConfigDep) -> PermissionsResponse:
     """Get per-service permission availability.
 
-    Reads permission states persisted by the macOS preflight window
-    and maps them to per-service availability. Services whose required
-    permissions have not been granted will have ``permitted=False`` with
-    a list of missing permission names.
+    Reads permission states persisted by the macOS preflight window and,
+    where possible, overrides them with live macOS queries so that grants
+    made after the last Preflight cycle are reflected immediately.
     """
     permissions_file = config.general.data_dir / "permissions.json"
 
@@ -260,6 +301,14 @@ async def get_permissions(config: ConfigDep) -> PermissionsResponse:
     notes_auto = perms.get("notes_automation", False)
     reminders_auto = perms.get("reminders_automation", False)
     photos_auto = perms.get("photos_automation", False)
+
+    live_fda = _check_full_disk_access_live()
+    if live_fda is not None:
+        fda = live_fda
+
+    live_reminders = _check_reminders_live()
+    if live_reminders is not None:
+        reminders_auto = live_reminders
 
     # Notes requires all three permissions
     notes_missing: list[str] = []
