@@ -54,8 +54,16 @@ class SchedulerManager:
         """Return True if the scheduler is actively running."""
         return self._running
 
-    def _refresh_config(self) -> None:
-        """Reload configuration from disk so scheduled runs see latest settings."""
+    async def _refresh_config(self) -> None:
+        """Reload configuration from disk and repoint DB handles if data_dir changed.
+
+        Saving config via the API can change ``data_dir`` at runtime. The
+        routes pick this up on their next call (the lru_cached config is
+        cleared on save), but the scheduler holds DB instances built at
+        startup. Without this re-pointing, the scheduler reads from the old
+        path, misses schedules the routes just wrote, and raises
+        "Schedule X not found" on trigger/add.
+        """
         config_path = getattr(self.config.general, "config_file", None)
         if not config_path:
             config_path = self.config.default_config_path
@@ -65,6 +73,19 @@ class SchedulerManager:
             self.config.ensure_data_dir()
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("Failed to reload config for scheduler: %s", exc)
+            return
+
+        expected_schedules_path = self.config.general.data_dir / "schedules.db"
+        if self.schedules_db.db_path != expected_schedules_path:
+            logger.info(
+                "Scheduler data_dir changed (%s -> %s); repointing DB handles",
+                self.schedules_db.db_path,
+                expected_schedules_path,
+            )
+            self.schedules_db = SchedulesDB(expected_schedules_path)
+            self.sync_logs_db = SyncLogsDB(self.config.general.data_dir / "sync_logs.db")
+            await self.schedules_db.initialize()
+            await self.sync_logs_db.initialize()
 
     async def start(self) -> None:
         """Start the scheduler and load all enabled schedules."""
@@ -148,7 +169,7 @@ class SchedulerManager:
     ) -> None:
         """Execute a scheduled sync operation for all services in the schedule."""
 
-        self._refresh_config()
+        await self._refresh_config()
 
         schedule = await self.schedules_db.get_schedule(schedule_id)
         if not schedule:
@@ -562,6 +583,7 @@ class SchedulerManager:
         Args:
             schedule_id: Schedule ID to add
         """
+        await self._refresh_config()
         schedule = await self.schedules_db.get_schedule(schedule_id)
         if schedule and schedule["enabled"]:
             await self._add_schedule_to_scheduler(schedule)
@@ -593,6 +615,7 @@ class SchedulerManager:
         Args:
             schedule_id: Schedule ID to trigger
         """
+        await self._refresh_config()
         schedule = await self.schedules_db.get_schedule(schedule_id)
         if not schedule:
             raise ValueError(f"Schedule {schedule_id} not found")
