@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.4] - 2026-05-12
+
+### Fixed
+- Notes sync no longer accumulates duplicate stubs of the same note. When the Shortcut pipeline's append step failed after `iCloudBridge_Upsert_Note` had created a new note, the empty stub was left in Apple Notes. The next scheduled run then saw two notes with the same title and the Shortcut hung on a "which note?" prompt that nobody could answer, producing yet another stub on each timeout — over time blowing up to dozens of empty copies. `_pull_from_remote` now refuses to call the Shortcut when more than one same-title note already exists in the target folder (failing fast with a clear error), and deletes the just-created stub by UUID if the append step fails before content is written.
+
 ## [0.2.3] - 2026-04-17
 
 ### Fixed

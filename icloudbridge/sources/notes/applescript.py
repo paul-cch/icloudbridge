@@ -309,6 +309,70 @@ on run argv
 end run
 """
 
+# AppleScript to list UUIDs of notes in a folder matching a given name
+LIST_NOTES_BY_NAME_SCRIPT = """
+on run argv
+    set {folder_path, note_name} to {item 1, item 2} of argv
+    tell application "Notes"
+        set target_folder to missing value
+        set all_folders to get every folder
+
+        repeat with test_folder in all_folders
+            set test_name to name of test_folder
+
+            set test_path to test_name
+            set test_container to missing value
+            try
+                set test_container to container of test_folder
+            end try
+
+            repeat while test_container is not missing value
+                try
+                    set parent_name to name of test_container
+                    set test_path to parent_name & "/" & test_path
+                    set test_container to container of test_container
+                on error
+                    set test_container to missing value
+                end try
+            end repeat
+
+            if test_path = folder_path then
+                set target_folder to test_folder
+                exit repeat
+            end if
+        end repeat
+
+        if target_folder is missing value then
+            error "Folder not found: " & folder_path
+        end if
+
+        set matching_notes to (notes of target_folder whose name is note_name)
+        set output to ""
+        repeat with theNote in matching_notes
+            if output is "" then
+                set output to (id of theNote) as string
+            else
+                set output to output & "|||" & (id of theNote)
+            end if
+        end repeat
+        return output
+    end tell
+end run
+"""
+
+
+# AppleScript to delete a note by its UUID (id)
+DELETE_NOTE_BY_ID_SCRIPT = """
+on run argv
+    set note_id to item 1 of argv
+    tell application "Notes"
+        set theNote to note id note_id
+        delete theNote
+    end tell
+end run
+"""
+
+
 # Check if Notes app is running
 IS_NOTES_RUNNING_SCRIPT = """
 tell application "System Events"
@@ -933,3 +997,24 @@ class NotesAdapter:
         except Exception as e:
             logger.error(f"Failed to delete note {note_name}: {e}")
             raise RuntimeError(f"Failed to delete note '{note_name}': {e}") from e
+
+    async def find_notes_by_name(self, folder_name: str, note_name: str) -> list[str]:
+        """Return UUIDs of all notes in a folder with the given name."""
+        await self.ensure_notes_running()
+        output = await self._run_applescript(
+            LIST_NOTES_BY_NAME_SCRIPT, folder_name, note_name
+        )
+        if not output:
+            return []
+        return [uid.strip() for uid in output.split("|||") if uid.strip()]
+
+    async def delete_note_by_uuid(self, note_uuid: str) -> bool:
+        """Delete a note by its Core Data UUID."""
+        await self.ensure_notes_running()
+        try:
+            await self._run_applescript(DELETE_NOTE_BY_ID_SCRIPT, note_uuid)
+            logger.info(f"Deleted note by UUID: {note_uuid}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete note by UUID {note_uuid}: {e}")
+            raise RuntimeError(f"Failed to delete note by UUID '{note_uuid}': {e}") from e

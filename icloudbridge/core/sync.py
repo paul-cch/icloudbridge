@@ -927,6 +927,19 @@ class NotesSyncEngine:
                 md_note.name,
                 folder_name,
             )
+
+            existing_uuids = await self.notes_adapter.find_notes_by_name(
+                folder_name, md_note.name
+            )
+            if len(existing_uuids) > 1:
+                raise RuntimeError(
+                    f"Refusing to sync '{md_note.name}' to folder '{folder_name}': "
+                    f"{len(existing_uuids)} notes already exist with this title. "
+                    f"Apple Shortcuts will hang waiting for a 'which note?' prompt. "
+                    f"Consolidate the duplicates manually before retrying."
+                )
+            pre_existing = set(existing_uuids)
+
             await self.shortcuts.upsert_note(folder_name, md_note.name)
             self.notes_adapter.clear_rich_cache()
 
@@ -943,19 +956,39 @@ class NotesSyncEngine:
                     f"Unable to locate note '{md_note.name}' in folder '{folder_name}' after shortcut upsert"
                 )
 
-            source_markdown = (
-                prepared_note.markdown_with_inline_attachments or prepared_note.markdown_body
-            )
-            markdown_body = strip_leading_heading(source_markdown, md_note.name)
-            segments = split_markdown_segments(markdown_body)
-            if not segments:
-                await self.shortcuts.append_content(folder_name, md_note.name, markdown_body)
-            else:
-                for segment_type, block in segments:
-                    if segment_type == "checklist":
-                        await self.shortcuts.append_checklist(folder_name, md_note.name, block)
-                    else:
-                        await self.shortcuts.append_content(folder_name, md_note.name, block)
+            created_by_upsert = new_uuid not in pre_existing
+
+            try:
+                source_markdown = (
+                    prepared_note.markdown_with_inline_attachments or prepared_note.markdown_body
+                )
+                markdown_body = strip_leading_heading(source_markdown, md_note.name)
+                segments = split_markdown_segments(markdown_body)
+                if not segments:
+                    await self.shortcuts.append_content(folder_name, md_note.name, markdown_body)
+                else:
+                    for segment_type, block in segments:
+                        if segment_type == "checklist":
+                            await self.shortcuts.append_checklist(folder_name, md_note.name, block)
+                        else:
+                            await self.shortcuts.append_content(folder_name, md_note.name, block)
+            except Exception:
+                if created_by_upsert:
+                    logger.warning(
+                        "Append step failed for '%s' in '%s'; removing stub note %s to prevent duplicate accumulation",
+                        md_note.name,
+                        folder_name,
+                        new_uuid,
+                    )
+                    try:
+                        await self.notes_adapter.delete_note_by_uuid(new_uuid)
+                    except Exception as cleanup_exc:
+                        logger.error(
+                            "Failed to remove stub note %s after append failure: %s",
+                            new_uuid,
+                            cleanup_exc,
+                        )
+                raise
 
             return new_uuid
 
