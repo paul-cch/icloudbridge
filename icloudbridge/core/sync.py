@@ -928,17 +928,9 @@ class NotesSyncEngine:
                 folder_name,
             )
 
-            existing_uuids = await self.notes_adapter.find_notes_by_name(
-                folder_name, md_note.name
+            pre_existing = set(
+                await self.notes_adapter.find_notes_by_name(folder_name, md_note.name)
             )
-            if len(existing_uuids) > 1:
-                raise RuntimeError(
-                    f"Refusing to sync '{md_note.name}' to folder '{folder_name}': "
-                    f"{len(existing_uuids)} notes already exist with this title. "
-                    f"Apple Shortcuts will hang waiting for a 'which note?' prompt. "
-                    f"Consolidate the duplicates manually before retrying."
-                )
-            pre_existing = set(existing_uuids)
 
             await self.shortcuts.upsert_note(folder_name, md_note.name)
             self.notes_adapter.clear_rich_cache()
@@ -948,7 +940,14 @@ class NotesSyncEngine:
                 if attempt:
                     await asyncio.sleep(0.5)
                     self.notes_adapter.clear_rich_cache()
-                new_uuid = await self.notes_adapter.get_note_uuid(folder_name, md_note.name)
+                post_upsert_uuids = await self.notes_adapter.find_notes_by_name(
+                    folder_name, md_note.name
+                )
+                fresh = [u for u in post_upsert_uuids if u not in pre_existing]
+                if fresh:
+                    new_uuid = fresh[0]
+                elif post_upsert_uuids:
+                    new_uuid = post_upsert_uuids[0]
                 if new_uuid:
                     break
             if not new_uuid:
@@ -957,6 +956,28 @@ class NotesSyncEngine:
                 )
 
             created_by_upsert = new_uuid not in pre_existing
+
+            # Shortcuts has no "edit note" action, so the pipeline is delete-old + create-new + append.
+            # If the upsert created a fresh note, remove the previous version(s) BEFORE append so the
+            # next shortcut call sees exactly one note with this title (no "which note?" prompt).
+            if created_by_upsert and pre_existing:
+                for stale_uuid in pre_existing:
+                    try:
+                        await self.notes_adapter.delete_note_by_uuid(stale_uuid)
+                        logger.info(
+                            "Replaced previous Apple note %s for '%s' with fresh note %s",
+                            stale_uuid,
+                            md_note.name,
+                            new_uuid,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to remove previous note %s for '%s': %s",
+                            stale_uuid,
+                            md_note.name,
+                            exc,
+                        )
+                self.notes_adapter.clear_rich_cache()
 
             try:
                 source_markdown = (
