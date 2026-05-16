@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - Notes sync no longer accumulates duplicate stubs of the same note when pulling from remote. Apple Shortcuts has no "edit note" action, so `_pull_from_remote` works by upserting (creating a fresh note) then appending content — but the previous version was being left behind, so the next run found two same-title notes and the `Append to Note` action hung indefinitely on a "which note?" prompt that nobody could answer, producing yet another empty stub on each timeout. `_pull_from_remote` now captures the pre-existing UUID set before the upsert and, once the fresh note is identified, deletes the previous version(s) by UUID before the append step runs — restoring the intended delete-old + create-new replacement behavior. The old content lands in Recently Deleted (30-day undo). Additionally, if the append step still fails for any reason, the just-created stub is removed automatically so the next sync starts from a clean state.
+- Notes sync no longer leaves orphaned rows in the `note_mapping` table after a pull replaces an Apple note with a fresh UUID. Both pull paths (only-remote-changed and conflict-resolution remote-wins) now delete the previous mapping row by its old UUID immediately after upserting the new row, so the mapping table stays at one row per note instead of growing one row per pull.
 
 ## [0.2.3] - 2026-04-17
 

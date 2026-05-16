@@ -430,6 +430,7 @@ class NotesSyncEngine:
 
                     if local_modified > last_sync and remote_modified > last_sync:
                         # Both changed since last sync - use last-write-wins (respecting sync mode)
+                        previous_uuid = uuid
                         if sync_mode == "export" or (sync_mode == "bidirectional" and local_modified > remote_modified):
                             # Export mode or local is newer in bidirectional - push to remote
                             if dry_run:
@@ -480,6 +481,8 @@ class NotesSyncEngine:
                                 timestamp=datetime.now().timestamp(),
                                 attachment_slug=attachment_slug,
                             )
+                            if previous_uuid and previous_uuid != uuid:
+                                await self.db.delete_mapping(previous_uuid)
 
                     elif local_modified > last_sync:
                         # Only local changed - push to remote (only in export/bidirectional mode)
@@ -522,6 +525,7 @@ class NotesSyncEngine:
                                 logger.info(f"[DRY RUN] Would update local: {apple_note.name}")
                             else:
                                 logger.info(f"Remote changed: {apple_note.name}")
+                                previous_uuid = uuid
                                 new_uuid = await self._pull_from_remote(
                                     md_note,
                                     folder_name,
@@ -538,6 +542,8 @@ class NotesSyncEngine:
                                     timestamp=datetime.now().timestamp(),
                                     attachment_slug=attachment_slug,
                                 )
+                                if previous_uuid != uuid:
+                                    await self.db.delete_mapping(previous_uuid)
                             stats["updated_local"] += 1
 
                     else:
