@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,26 @@ class NotionSchemaReport:
     def missing_identity_properties(self) -> list[str]:
         """Identity properties that must be created before sync writes."""
         return [check.name for check in self.identity if not check.ok]
+
+
+@dataclass
+class NotionTask:
+    """Normalized Notion Tasks row for read-only sync planning."""
+
+    page_id: str
+    title: str
+    notes: str | None
+    completed: bool
+    status: str
+    priority: str | None
+    due_date: datetime | None
+    due_is_all_day: bool
+    reminder_at: datetime | None
+    last_edited_time: datetime | None
+    apple_sync_id: str | None
+    apple_reminder_id: str | None
+    url: str | None
+    raw_properties: dict[str, Any]
 
 
 class NotionAuthError(RuntimeError):
@@ -155,6 +176,20 @@ def build_exact_title_query(title: str, page_size: int = 10) -> dict[str, Any]:
     }
 
 
+def build_apple_sync_id_query(page_size: int = 100, start_cursor: str | None = None) -> dict[str, Any]:
+    """Build a safe query for only rows explicitly enrolled with Apple Sync ID."""
+    query: dict[str, Any] = {
+        "filter": {
+            "property": "Apple Sync ID",
+            "rich_text": {"is_not_empty": True},
+        },
+        "page_size": page_size,
+    }
+    if start_cursor:
+        query["start_cursor"] = start_cursor
+    return query
+
+
 def _rich_text(content: str) -> dict[str, Any]:
     return {"rich_text": [{"text": {"content": content}}]}
 
@@ -205,6 +240,63 @@ def page_notes(page: dict[str, Any]) -> str:
     return plain_text_from_property(page.get("properties", {}).get("Notes"))
 
 
+def _select_name(prop: dict[str, Any] | None, prop_type: str) -> str | None:
+    if not isinstance(prop, dict):
+        return None
+    value = prop.get(prop_type)
+    if not isinstance(value, dict):
+        return None
+    return value.get("name")
+
+
+def _parse_notion_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _parse_date_property(prop: dict[str, Any] | None) -> tuple[datetime | None, bool]:
+    if not isinstance(prop, dict):
+        return None, False
+    date_value = prop.get("date")
+    if not isinstance(date_value, dict):
+        return None, False
+    start = date_value.get("start")
+    if not start:
+        return None, False
+    is_all_day = "T" not in start
+    return _parse_notion_datetime(start), is_all_day
+
+
+def parse_notion_task(page: dict[str, Any]) -> NotionTask:
+    """Convert a Notion page payload into a normalized task."""
+    properties = page.get("properties", {})
+    due_date, due_is_all_day = _parse_date_property(properties.get("Due Date"))
+    reminder_at, _ = _parse_date_property(properties.get("Reminder At"))
+    status = _select_name(properties.get("Status"), "status") or ""
+
+    return NotionTask(
+        page_id=page.get("id", ""),
+        title=page_title(page),
+        notes=page_notes(page) or None,
+        completed=status in {"Done", "Cancelled"},
+        status=status,
+        priority=_select_name(properties.get("Priority"), "select"),
+        due_date=due_date,
+        due_is_all_day=due_is_all_day,
+        reminder_at=reminder_at,
+        last_edited_time=_parse_notion_datetime(page.get("last_edited_time")),
+        apple_sync_id=page_apple_sync_id(page) or None,
+        apple_reminder_id=plain_text_from_property(properties.get("Apple Reminder ID")) or None,
+        url=page.get("url"),
+        raw_properties=properties,
+    )
+
+
 class NotionTasksAdapter:
     """Small Notion API client for preflight checks."""
 
@@ -247,6 +339,34 @@ class NotionTasksAdapter:
             )
             response.raise_for_status()
             return response.json().get("results", [])
+
+    async def query_tasks_with_apple_sync_id(
+        self, data_source_id: str, page_size: int = 100
+    ) -> list[NotionTask]:
+        """Read only Notion rows explicitly enrolled with Apple Sync ID."""
+        tasks: list[NotionTask] = []
+        start_cursor: str | None = None
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            while True:
+                response = await client.post(
+                    f"{self.base_url}/v1/data_sources/{data_source_id}/query",
+                    headers=self._headers(),
+                    json=build_apple_sync_id_query(
+                        page_size=page_size,
+                        start_cursor=start_cursor,
+                    ),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                tasks.extend(parse_notion_task(page) for page in payload.get("results", []))
+                if not payload.get("has_more"):
+                    break
+                start_cursor = payload.get("next_cursor")
+                if not start_cursor:
+                    break
+
+        return tasks
 
     async def create_disposable_task(
         self,

@@ -7,7 +7,9 @@ from icloudbridge.sources.reminders.notion_adapter import (
     DISPOSABLE_NOTION_TO_APPLE_TITLE,
     NotionTasksAdapter,
     build_disposable_task_properties,
+    build_apple_sync_id_query,
     build_exact_title_query,
+    parse_notion_task,
     _find_token_in_json,
 )
 
@@ -164,4 +166,62 @@ def test_build_exact_title_query_filters_only_the_disposable_title():
             "title": {"equals": DISPOSABLE_APPLE_TO_NOTION_TITLE},
         },
         "page_size": 10,
+    }
+
+
+def test_parse_notion_task_extracts_safe_sync_fields():
+    page = {
+        "id": "page-id",
+        "url": "https://notion.so/page-id",
+        "last_edited_time": "2026-05-25T13:30:00.000Z",
+        "properties": {
+            "Task Name": {
+                "type": "title",
+                "title": [{"plain_text": "[SYNC TEST] Notion to Apple"}],
+            },
+            "Notes": {
+                "type": "rich_text",
+                "rich_text": [{"plain_text": "Proof note"}],
+            },
+            "Status": {"type": "status", "status": {"name": "Done"}},
+            "Priority": {"type": "select", "select": {"name": "High"}},
+            "Due Date": {"type": "date", "date": {"start": "2026-05-26"}},
+            "Reminder At": {
+                "type": "date",
+                "date": {"start": "2026-05-26T09:30:00.000+01:00"},
+            },
+            "Apple Sync ID": {
+                "type": "rich_text",
+                "rich_text": [{"plain_text": "sync-id"}],
+            },
+            "Apple Reminder ID": {
+                "type": "rich_text",
+                "rich_text": [{"plain_text": "apple-id"}],
+            },
+        },
+    }
+
+    task = parse_notion_task(page)
+
+    assert task.page_id == "page-id"
+    assert task.title == "[SYNC TEST] Notion to Apple"
+    assert task.notes == "Proof note"
+    assert task.completed is True
+    assert task.status == "Done"
+    assert task.priority == "High"
+    assert task.due_is_all_day is True
+    assert task.apple_sync_id == "sync-id"
+    assert task.apple_reminder_id == "apple-id"
+    assert task.url == "https://notion.so/page-id"
+
+
+def test_build_apple_sync_id_query_only_reads_enrolled_rows():
+    query = build_apple_sync_id_query(page_size=25)
+
+    assert query == {
+        "filter": {
+            "property": "Apple Sync ID",
+            "rich_text": {"is_not_empty": True},
+        },
+        "page_size": 25,
     }

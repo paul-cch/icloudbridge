@@ -19,6 +19,7 @@ from icloudbridge.core.photos_sync import PhotoSyncEngine
 from icloudbridge.core.reminders_sync import RemindersSyncEngine
 from icloudbridge.core.rich_notes_export import RichNotesExporter
 from icloudbridge.core.sync import NotesSyncEngine
+from icloudbridge.core.notion_reminders_readonly import build_readonly_match_report
 from icloudbridge.sources.reminders.notion_adapter import (
     DEFAULT_NOTION_API_VERSION,
     DEFAULT_TASKS_DATA_SOURCE_ID,
@@ -1327,6 +1328,160 @@ def reminders_notion_proof(
         return True
 
     passed = asyncio.run(run_proof())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-readonly")
+def reminders_notion_readonly(
+    data_source_id: str = typer.Option(
+        DEFAULT_TASKS_DATA_SOURCE_ID,
+        "--data-source-id",
+        help="Notion Tasks data source ID to read",
+    ),
+    apple_calendar: str = typer.Option(
+        "Notion Sync Test",
+        "--apple-calendar",
+        "-a",
+        help="Apple Reminders list to compare",
+    ),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+        help="Notion API token. Defaults to NOTION_API_TOKEN or ntn file auth.",
+    ),
+    api_version: str = typer.Option(
+        DEFAULT_NOTION_API_VERSION,
+        "--notion-version",
+        help="Notion API version header",
+    ),
+    notion_page_size: int = typer.Option(
+        100,
+        "--notion-page-size",
+        min=1,
+        max=100,
+        help="Notion page size for the enrolled-row read",
+    ),
+) -> None:
+    """Read Notion and Apple reminders, then print read-only match buckets."""
+
+    def date_label(value) -> str:
+        if value is None:
+            return ""
+        return value.isoformat()
+
+    async def run_readonly() -> bool:
+        from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+
+        try:
+            token = load_notion_token(notion_token)
+        except NotionAuthError as exc:
+            console.print(f"[red]Notion auth failed:[/red] {exc}")
+            return False
+
+        notion = NotionTasksAdapter(token=token, api_version=api_version)
+
+        try:
+            report = await notion.preflight_schema(data_source_id)
+            if not report.ok:
+                _print_notion_schema_report(report)
+                return False
+            notion_tasks = await notion.query_tasks_with_apple_sync_id(
+                data_source_id=data_source_id,
+                page_size=notion_page_size,
+            )
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            console.print(
+                f"[red]Notion read-only proof failed:[/red] "
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+            return False
+        except httpx.HTTPError as exc:
+            console.print(f"[red]Notion read-only proof failed:[/red] {exc}")
+            return False
+
+        try:
+            reminders = RemindersAdapter()
+            if not await reminders.request_access():
+                console.print("[red]Apple Reminders access was not granted.[/red]")
+                return False
+
+            calendars = await reminders.list_calendars()
+            target_calendar = next((cal for cal in calendars if cal.title == apple_calendar), None)
+            if not target_calendar:
+                console.print(
+                    f"[red]Apple Reminders list not found:[/red] {apple_calendar!r}"
+                )
+                return False
+            apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+        except Exception as exc:
+            console.print(f"[red]Apple read-only proof failed:[/red] {exc}")
+            return False
+
+        match_report = build_readonly_match_report(notion_tasks, apple_reminders)
+
+        summary = Table(title="Milestone 1 Read-Only Summary")
+        summary.add_column("Bucket", style="cyan")
+        summary.add_column("Count", style="green", justify="right")
+        summary.add_row("Notion enrolled rows", str(len(notion_tasks)))
+        summary.add_row(f"Apple reminders in {apple_calendar}", str(len(apple_reminders)))
+        summary.add_row("Matched", str(len(match_report.matched)))
+        summary.add_row("Notion-only", str(len(match_report.notion_only)))
+        summary.add_row("Apple-only", str(len(match_report.apple_only)))
+        console.print(summary)
+
+        matched_table = Table(title="Matched")
+        matched_table.add_column("Reason", style="cyan")
+        matched_table.add_column("Notion")
+        matched_table.add_column("Apple")
+        matched_table.add_column("Status")
+        for item in match_report.matched:
+            matched_table.add_row(
+                item.reason,
+                item.notion_task.title,
+                item.apple_reminder.title,
+                item.notion_task.status,
+            )
+        console.print(matched_table)
+
+        notion_table = Table(title="Notion-Only")
+        notion_table.add_column("Title")
+        notion_table.add_column("Status", style="cyan")
+        notion_table.add_column("Apple Sync ID")
+        notion_table.add_column("Due")
+        for task in match_report.notion_only:
+            notion_table.add_row(
+                task.title,
+                task.status,
+                task.apple_sync_id or "",
+                date_label(task.due_date),
+            )
+        console.print(notion_table)
+
+        apple_table = Table(title="Apple-Only")
+        apple_table.add_column("Title")
+        apple_table.add_column("Completed", style="cyan")
+        apple_table.add_column("Apple ID")
+        apple_table.add_column("Due")
+        for reminder in match_report.apple_only:
+            apple_table.add_row(
+                reminder.title,
+                "yes" if reminder.completed else "no",
+                reminder.uuid,
+                date_label(reminder.due_date),
+            )
+        console.print(apple_table)
+
+        console.print(
+            "\n[green]Milestone 1 read-only proof completed.[/green]\n"
+            "[dim]No Notion pages or Apple reminders were created, updated, completed, "
+            "cancelled, or deleted.[/dim]"
+        )
+        return True
+
+    passed = asyncio.run(run_readonly())
     if not passed:
         raise typer.Exit(1)
 
