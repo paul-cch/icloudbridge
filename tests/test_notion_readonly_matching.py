@@ -1,13 +1,16 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from icloudbridge.core.notion_reminders_readonly import (
     ReadOnlyMatchReport,
+    assert_expected_proof_plan,
+    assert_proof_ready_plan,
     build_apple_snapshot,
     build_bidirectional_update_plan,
     build_notion_snapshot,
+    build_proof_mutation,
     execute_create_apple_plan,
     execute_create_notion_plan,
     execute_update_apple_plan,
@@ -206,6 +209,100 @@ def test_map_apple_priority_to_notion_is_conservative():
     assert map_apple_priority_to_notion(4) == "High"
     assert map_apple_priority_to_notion(5) == "Medium"
     assert map_apple_priority_to_notion(9) == "Low"
+
+
+def test_build_proof_mutation_maps_each_field_for_notion_source():
+    timed = build_proof_mutation("timed-due", "notion-to-apple")
+    assert timed.expected_action == "UPDATE_APPLE"
+    assert timed.notion_updates == {
+        "title": None,
+        "notes": None,
+        "completed": None,
+        "notion_priority": None,
+        "due_date": datetime(2026, 6, 2, 9, 30, tzinfo=timezone(timedelta(hours=1))),
+        "due_is_all_day": False,
+    }
+
+    all_day = build_proof_mutation("all-day-due", "notion-to-apple")
+    assert all_day.notion_updates["due_date"] == datetime(2026, 6, 3, tzinfo=timezone.utc)
+    assert all_day.notion_updates["due_is_all_day"] is True
+
+    clear_due = build_proof_mutation("clear-due", "notion-to-apple")
+    assert clear_due.notion_updates["due_date"] is None
+    assert clear_due.notion_updates["due_is_all_day"] is False
+
+
+def test_build_proof_mutation_maps_each_field_for_apple_source():
+    priority = build_proof_mutation("priority", "apple-to-notion")
+    assert priority.expected_action == "UPDATE_NOTION"
+    assert priority.apple_updates == {
+        "title": None,
+        "notes": None,
+        "completed": None,
+        "priority": 1,
+        "due_date": None,
+        "is_all_day": False,
+        "clear_due_date": False,
+    }
+
+    notes = build_proof_mutation("notes", "apple-to-notion")
+    assert notes.apple_updates["notes"] == "Milestone 5D apple-to-notion notes proof"
+
+
+def test_build_proof_mutation_rejects_unknown_field_and_direction():
+    with pytest.raises(ValueError, match="Unsupported proof field"):
+        build_proof_mutation("bad-field", "notion-to-apple")
+    with pytest.raises(ValueError, match="Unsupported proof direction"):
+        build_proof_mutation("notes", "sideways")
+
+
+def test_assert_proof_ready_plan_requires_two_noops():
+    task = _notion_task("Same title", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("Same title", "apple-1")
+    plan = build_bidirectional_update_plan(
+        build_readonly_match_report([task], [apple]),
+        [_mapping_for(task, apple)],
+    )
+
+    with pytest.raises(ValueError, match="exactly 2 NOOP"):
+        assert_proof_ready_plan(plan)
+
+    second_task = _notion_task("Second", sync_id="sync-2", reminder_id="apple-2")
+    second_apple = _apple_reminder("Second", "apple-2")
+    ready_plan = build_bidirectional_update_plan(
+        build_readonly_match_report([task, second_task], [apple, second_apple]),
+        [_mapping_for(task, apple), _mapping_for(second_task, second_apple)],
+    )
+    assert_proof_ready_plan(ready_plan)
+
+
+def test_assert_expected_proof_plan_requires_one_expected_update():
+    base_task = _notion_task("[SYNC TEST] Same", sync_id="sync-1", reminder_id="apple-1")
+    changed_task = _notion_task("[SYNC TEST] Changed", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("[SYNC TEST] Same", "apple-1")
+    plan = build_bidirectional_update_plan(
+        build_readonly_match_report([changed_task], [apple]),
+        [_mapping_for(base_task, apple)],
+    )
+
+    action = assert_expected_proof_plan(plan, "UPDATE_APPLE")
+
+    assert action.kind == "UPDATE_APPLE"
+    with pytest.raises(ValueError, match="Expected exactly one UPDATE_NOTION"):
+        assert_expected_proof_plan(plan, "UPDATE_NOTION")
+
+
+def test_assert_expected_proof_plan_rejects_non_sync_test_rows():
+    base_task = _notion_task("Same", sync_id="sync-1", reminder_id="apple-1")
+    changed_task = _notion_task("Changed", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("Same", "apple-1")
+    plan = build_bidirectional_update_plan(
+        build_readonly_match_report([changed_task], [apple]),
+        [_mapping_for(base_task, apple)],
+    )
+
+    with pytest.raises(ValueError, match=r"\[SYNC TEST\]"):
+        assert_expected_proof_plan(plan, "UPDATE_APPLE")
 
 
 def _mapping_for(task, reminder, notion_snapshot=None, apple_snapshot=None):

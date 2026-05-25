@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -141,6 +141,19 @@ class UpdateNotionExecutionResult:
     skipped_non_update_notion: int = 0
 
 
+@dataclass
+class ProofMutation:
+    """Deterministic source-side mutation for a Milestone 5D proof run."""
+
+    field: str
+    direction: str
+    expected_action: str
+    summary: str
+    notion_updates: dict[str, Any] = field(default_factory=dict)
+    apple_updates: dict[str, Any] = field(default_factory=dict)
+    restore_title: bool = False
+
+
 class CreateApplePartialFailure(RuntimeError):
     """Raised after Apple creation succeeds but identity persistence fails."""
 
@@ -171,6 +184,108 @@ def map_apple_priority_to_notion(priority: int | None) -> str | None:
     if 6 <= priority <= 9:
         return "Low"
     return None
+
+
+def build_proof_mutation(field: str, direction: str) -> ProofMutation:
+    """Build deterministic test-slice proof mutation payloads."""
+    if field not in {
+        "title",
+        "notes",
+        "completion",
+        "priority",
+        "timed-due",
+        "all-day-due",
+        "clear-due",
+    }:
+        raise ValueError(f"Unsupported proof field: {field}")
+    if direction not in {"notion-to-apple", "apple-to-notion"}:
+        raise ValueError(f"Unsupported proof direction: {direction}")
+
+    expected_action = "UPDATE_APPLE" if direction == "notion-to-apple" else "UPDATE_NOTION"
+    notion_updates = {
+        "title": None,
+        "notes": None,
+        "completed": None,
+        "notion_priority": None,
+        "due_date": None,
+        "due_is_all_day": False,
+    }
+    apple_updates = {
+        "title": None,
+        "notes": None,
+        "completed": None,
+        "priority": None,
+        "due_date": None,
+        "is_all_day": False,
+        "clear_due_date": False,
+    }
+
+    if field == "title":
+        value = f"[SYNC TEST] {direction} title proof"
+        notion_updates["title"] = value
+        apple_updates["title"] = value
+    elif field == "notes":
+        value = f"Milestone 5D {direction} notes proof"
+        notion_updates["notes"] = value
+        apple_updates["notes"] = value
+    elif field == "completion":
+        notion_updates["completed"] = True
+        apple_updates["completed"] = True
+    elif field == "priority":
+        notion_updates["notion_priority"] = "High"
+        apple_updates["priority"] = 1
+    elif field == "timed-due":
+        value = datetime(2026, 6, 2, 9, 30, tzinfo=timezone(timedelta(hours=1)))
+        notion_updates["due_date"] = value
+        apple_updates["due_date"] = value
+    elif field == "all-day-due":
+        value = datetime(2026, 6, 3, tzinfo=timezone.utc)
+        notion_updates["due_date"] = value
+        notion_updates["due_is_all_day"] = True
+        apple_updates["due_date"] = value
+        apple_updates["is_all_day"] = True
+    elif field == "clear-due":
+        apple_updates["clear_due_date"] = True
+
+    return ProofMutation(
+        field=field,
+        direction=direction,
+        expected_action=expected_action,
+        summary=f"{direction} {field} proof",
+        notion_updates=notion_updates,
+        apple_updates=apple_updates,
+        restore_title=field == "title",
+    )
+
+
+def assert_proof_ready_plan(plan: BidirectionalUpdatePlan) -> None:
+    """Require the proof slice to start from two unchanged matched rows."""
+    if plan.counts != {
+        "NOOP": 2,
+        "NEEDS_BASELINE": 0,
+        "UPDATE_APPLE": 0,
+        "UPDATE_NOTION": 0,
+        "CONFLICT": 0,
+    }:
+        raise ValueError(f"Proof requires exactly 2 NOOP rows, got {plan.counts}")
+
+
+def assert_expected_proof_plan(
+    plan: BidirectionalUpdatePlan,
+    expected_action: str,
+) -> UpdatePlannedAction:
+    """Require exactly one expected update action against a sync-test row."""
+    matching = [action for action in plan.actions if action.kind == expected_action]
+    if len(matching) != 1:
+        raise ValueError(f"Expected exactly one {expected_action}, got {plan.counts}")
+    if plan.counts["NEEDS_BASELINE"] or plan.counts["CONFLICT"]:
+        raise ValueError(f"Proof cannot continue with baseline/conflict actions: {plan.counts}")
+    action = matching[0]
+    title = action.title or ""
+    apple_title = getattr(action.apple_reminder, "title", "") if action.apple_reminder else ""
+    if not title.startswith("[SYNC TEST]") and not apple_title.startswith("[SYNC TEST]"):
+        raise ValueError("Proof may only mutate [SYNC TEST] rows")
+    return action
 
 
 def _normalized_notes(value: str | None) -> str | None:

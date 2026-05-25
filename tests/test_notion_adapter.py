@@ -8,6 +8,7 @@ from icloudbridge.sources.reminders.notion_adapter import (
     NotionTasksAdapter,
     build_apple_origin_task_properties,
     build_apple_reminder_id_patch,
+    build_task_proof_update_properties,
     build_task_update_from_apple_properties,
     build_disposable_task_properties,
     build_apple_sync_id_query,
@@ -331,3 +332,32 @@ def test_build_task_update_from_apple_properties_omits_priority_when_none():
     assert properties["Status"]["status"]["name"] == "Not started"
     assert "Priority" not in properties
     assert properties["Due Date"]["date"] is None
+
+
+def test_build_task_proof_update_properties_updates_only_requested_fields():
+    from datetime import datetime, timedelta, timezone
+
+    properties = build_task_proof_update_properties(
+        title="[SYNC TEST] Proof title",
+        notes="Proof note",
+        completed=True,
+        notion_priority="High",
+        due_date=datetime(2026, 6, 2, 9, 30, tzinfo=timezone(timedelta(hours=1))),
+        due_is_all_day=False,
+    )
+
+    assert properties["Task Name"]["title"][0]["text"]["content"] == "[SYNC TEST] Proof title"
+    assert properties["Notes"]["rich_text"][0]["text"]["content"] == "Proof note"
+    assert properties["Status"]["status"]["name"] == "Done"
+    assert properties["Priority"]["select"]["name"] == "High"
+    assert properties["Due Date"]["date"]["start"] == "2026-06-02T09:30:00+01:00"
+
+
+def test_build_task_proof_update_properties_can_clear_due_date():
+    properties = build_task_proof_update_properties(
+        due_date=None,
+        due_is_all_day=False,
+        clear_due_date=True,
+    )
+
+    assert properties == {"Due Date": {"date": None}}

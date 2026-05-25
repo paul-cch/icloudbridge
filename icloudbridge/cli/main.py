@@ -23,9 +23,12 @@ from icloudbridge.core.sync import NotesSyncEngine
 from icloudbridge.core.notion_reminders_readonly import (
     CreateApplePartialFailure,
     CreateNotionPartialFailure,
+    assert_expected_proof_plan,
+    assert_proof_ready_plan,
     build_apple_snapshot,
     build_bidirectional_update_plan,
     build_notion_snapshot,
+    build_proof_mutation,
     build_readonly_match_report,
     build_readonly_sync_plan,
     execute_create_apple_plan,
@@ -2365,6 +2368,253 @@ def reminders_notion_update_notion(
             return False
 
     passed = asyncio.run(run_update_notion())
+    if not passed:
+        raise typer.Exit(1)
+
+
+def _pick_proof_noop_action(update_plan, direction: str):
+    candidates = [
+        action
+        for action in update_plan.actions
+        if action.kind == "NOOP"
+        and action.notion_task is not None
+        and action.apple_reminder is not None
+    ]
+    preferred = "Notion to Apple" if direction == "notion-to-apple" else "Apple to Notion"
+    for action in candidates:
+        if preferred in action.title or preferred in getattr(action.apple_reminder, "title", ""):
+            return action
+    if candidates:
+        return candidates[0]
+    raise ValueError("Proof requires one matched NOOP row to mutate")
+
+
+async def _baseline_update_actions(db, update_plan) -> int:
+    count = 0
+    for action in update_plan.actions:
+        if action.notion_task is None or action.apple_reminder is None:
+            continue
+        await db.update_notion_reminder_snapshots(
+            apple_sync_id=action.notion_task.apple_sync_id
+            or (action.mapping or {}).get("apple_sync_id")
+            or action.notion_task.page_id,
+            notion_snapshot=build_notion_snapshot(action.notion_task),
+            apple_snapshot=build_apple_snapshot(action.apple_reminder),
+            timestamp=datetime.now(timezone.utc),
+        )
+        count += 1
+    return count
+
+
+@reminders_app.command("notion-update-proof")
+def reminders_notion_update_proof(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    field: str = typer.Option(..., "--field", help="Field to prove"),
+    direction: str = typer.Option(..., "--direction", help="Proof direction"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    apply: bool = typer.Option(False, "--apply", help="Actually run the live proof"),
+) -> None:
+    """Run one Milestone 5D test-slice field proof."""
+
+    async def run_update_proof() -> bool:
+        if apple_calendar != "Notion Sync Test":
+            console.print("[red]Refusing proof:[/red] only 'Notion Sync Test' is allowed.")
+            return False
+        if not apply:
+            console.print("[red]Refusing proof:[/red] --apply is required for live mutations.")
+            return False
+
+        try:
+            mutation = build_proof_mutation(field, direction)
+            initial_plan, notion, reminders, db = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if initial_plan is None or notion is None or reminders is None or db is None:
+                return False
+            assert_proof_ready_plan(initial_plan)
+            target = _pick_proof_noop_action(initial_plan, direction)
+            assert_expected_proof_plan(
+                build_bidirectional_update_plan(
+                    build_readonly_match_report(
+                        [target.notion_task],
+                        [target.apple_reminder],
+                    ),
+                    [target.mapping] if target.mapping else [],
+                ),
+                "NOOP",
+            )
+
+            original_title = target.title
+            original_page_id = target.notion_task.page_id
+            original_reminder_id = getattr(target.apple_reminder, "uuid", "")
+            if not original_title.startswith("[SYNC TEST]"):
+                raise ValueError("Proof may only mutate [SYNC TEST] rows")
+
+            if direction == "notion-to-apple":
+                updates = dict(mutation.notion_updates)
+                if field == "completion":
+                    updates["completed"] = not target.notion_task.completed
+                await notion.update_task_proof_fields(
+                    page_id=target.notion_task.page_id,
+                    clear_due_date=field == "clear-due",
+                    **updates,
+                )
+                expected_action = "UPDATE_APPLE"
+            else:
+                updates = dict(mutation.apple_updates)
+                if field == "completion":
+                    updates["completed"] = not getattr(target.apple_reminder, "completed", False)
+                await reminders.update_reminder(
+                    uuid=getattr(target.apple_reminder, "uuid", ""),
+                    **updates,
+                )
+                expected_action = "UPDATE_NOTION"
+
+            proof_plan, _, _, _ = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if proof_plan is None:
+                return False
+            assert_expected_proof_plan(proof_plan, expected_action)
+
+            if direction == "notion-to-apple":
+                first = await execute_update_apple_plan(
+                    proof_plan,
+                    apple_calendar_name=apple_calendar,
+                    reminders_adapter=reminders,
+                    db=db,
+                )
+                first_count = first.updated_apple
+                second_plan, _, _, _ = await _read_notion_update_plan(
+                    data_source_id,
+                    apple_calendar,
+                    notion_token,
+                    api_version,
+                    notion_page_size,
+                    ctx.obj["config"].reminders_db_path,
+                )
+                if second_plan is None:
+                    return False
+                assert_proof_ready_plan(second_plan)
+                second = await execute_update_apple_plan(
+                    second_plan,
+                    apple_calendar_name=apple_calendar,
+                    reminders_adapter=reminders,
+                    db=db,
+                )
+                second_count = second.updated_apple
+            else:
+                first = await execute_update_notion_plan(
+                    proof_plan,
+                    apple_calendar_name=apple_calendar,
+                    notion_adapter=notion,
+                    db=db,
+                )
+                first_count = first.updated_notion
+                second_plan, _, _, _ = await _read_notion_update_plan(
+                    data_source_id,
+                    apple_calendar,
+                    notion_token,
+                    api_version,
+                    notion_page_size,
+                    ctx.obj["config"].reminders_db_path,
+                )
+                if second_plan is None:
+                    return False
+                assert_proof_ready_plan(second_plan)
+                second = await execute_update_notion_plan(
+                    second_plan,
+                    apple_calendar_name=apple_calendar,
+                    notion_adapter=notion,
+                    db=db,
+                )
+                second_count = second.updated_notion
+
+            if first_count != 1:
+                raise ValueError(f"Proof expected first apply to update 1 row, got {first_count}")
+            if second_count != 0:
+                raise ValueError(f"Proof expected second apply to update 0 rows, got {second_count}")
+
+            final_plan, _, _, _ = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if final_plan is None:
+                return False
+            assert_proof_ready_plan(final_plan)
+
+            if mutation.restore_title:
+                await notion.update_task_proof_fields(
+                    page_id=original_page_id,
+                    title=original_title,
+                )
+                await reminders.update_reminder(
+                    uuid=original_reminder_id,
+                    title=original_title,
+                )
+                restored_plan, _, _, restored_db = await _read_notion_update_plan(
+                    data_source_id,
+                    apple_calendar,
+                    notion_token,
+                    api_version,
+                    notion_page_size,
+                    ctx.obj["config"].reminders_db_path,
+                )
+                if restored_plan is None or restored_db is None:
+                    return False
+                await _baseline_update_actions(restored_db, restored_plan)
+                final_plan, _, _, _ = await _read_notion_update_plan(
+                    data_source_id,
+                    apple_calendar,
+                    notion_token,
+                    api_version,
+                    notion_page_size,
+                    ctx.obj["config"].reminders_db_path,
+                )
+                if final_plan is None:
+                    return False
+                assert_proof_ready_plan(final_plan)
+
+            receipt = Table(title="Milestone 5D Proof Result")
+            receipt.add_column("Metric", style="cyan")
+            receipt.add_column("Value", style="green")
+            receipt.add_row("Field", field)
+            receipt.add_row("Direction", direction)
+            receipt.add_row("Source mutation", mutation.summary)
+            receipt.add_row("Expected action", expected_action)
+            receipt.add_row("First apply updates", str(first_count))
+            receipt.add_row("Second apply updates", str(second_count))
+            receipt.add_row("Final counts", str(final_plan.counts))
+            console.print(receipt)
+            return True
+
+        except Exception as exc:
+            console.print(f"[red]Milestone 5D proof failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_update_proof())
     if not passed:
         raise typer.Exit(1)
 

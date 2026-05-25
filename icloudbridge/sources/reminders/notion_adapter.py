@@ -270,6 +270,38 @@ def build_task_update_from_apple_properties(
     return properties
 
 
+def build_task_proof_update_properties(
+    title: str | None = None,
+    notes: str | None = None,
+    completed: bool | None = None,
+    notion_priority: str | None = None,
+    due_date: datetime | None = None,
+    due_is_all_day: bool = False,
+    clear_due_date: bool = False,
+) -> dict[str, Any]:
+    """Build a narrow proof-only Notion task patch."""
+    properties: dict[str, Any] = {}
+    if title is not None:
+        properties["Task Name"] = {"title": [{"text": {"content": title}}]}
+    if notes is not None:
+        properties["Notes"] = _rich_text(notes) if notes else {"rich_text": []}
+    if completed is not None:
+        properties["Status"] = {"status": {"name": "Done" if completed else "Not started"}}
+    if notion_priority is not None:
+        properties["Priority"] = {"select": {"name": notion_priority}}
+    if due_date is not None:
+        properties["Due Date"] = {
+            "date": {
+                "start": due_date.date().isoformat()
+                if due_is_all_day
+                else due_date.isoformat()
+            }
+        }
+    elif clear_due_date:
+        properties["Due Date"] = {"date": None}
+    return properties
+
+
 def build_notes_patch(notes: str) -> dict[str, Any]:
     """Build a Notion page property patch for the Notes field."""
     return {"Notes": _rich_text(notes)}
@@ -552,6 +584,37 @@ class NotionTasksAdapter:
                         notion_priority=notion_priority,
                         due_date=due_date,
                         due_is_all_day=due_is_all_day,
+                    )
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def update_task_proof_fields(
+        self,
+        page_id: str,
+        title: str | None = None,
+        notes: str | None = None,
+        completed: bool | None = None,
+        notion_priority: str | None = None,
+        due_date: datetime | None = None,
+        due_is_all_day: bool = False,
+        clear_due_date: bool = False,
+    ) -> dict[str, Any]:
+        """Update selected safe task fields for a test-slice proof run."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.patch(
+                f"{self.base_url}/v1/pages/{page_id}",
+                headers=self._headers(),
+                json={
+                    "properties": build_task_proof_update_properties(
+                        title=title,
+                        notes=notes,
+                        completed=completed,
+                        notion_priority=notion_priority,
+                        due_date=due_date,
+                        due_is_all_day=due_is_all_day,
+                        clear_due_date=clear_due_date,
                     )
                 },
             )
