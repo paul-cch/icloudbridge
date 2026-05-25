@@ -2,9 +2,9 @@
 
 ## Confidence Statement
 
-Milestones 0 through 5D are implemented and proven against the live `Notion Sync Test` slice.
+Milestones 0 through 6 are implemented and proven against the live `Notion Sync Test` slice.
 
-The strategy is now high-confidence for the disposable test slice, including creates and bidirectional updates for title, notes, completion, priority, timed due dates, all-day due dates, and due-date clearing. It is not yet production-ready for normal lists because identity recovery, Notion 429 retry behavior, and deletion/cancellation grace policy remain open.
+The strategy is now high-confidence for the disposable test slice, including creates, bidirectional updates for title, notes, completion, priority, timed due dates, all-day due dates, due-date clearing, and stale Apple Reminder ID recovery. It is not yet production-ready for normal lists because Notion 429 retry behavior and deletion/cancellation grace policy remain open.
 
 ## Goal
 
@@ -433,11 +433,14 @@ Done when: every supported update field converges to `NOOP: 2`, and the same exe
 
 ### Milestone 6: Identity Recovery
 
-- Simulate a lost Apple local identifier.
-- Recover by external identifier or sync UUID plus fallback properties.
-- Avoid false deletion.
+- Status: implemented and live-proven for the test slice.
+- Command: `icloudbridge reminders notion-recovery-proof --apple-calendar "Notion Sync Test" --apply`.
+- Simulates a lost Apple local identifier by patching one `[SYNC TEST]` Notion row's `Apple Reminder ID` to `MILESTONE-6-STALE-ID`.
+- Recovers the ID by matching the enrolled Notion row to exactly one current Apple reminder with the same title.
+- Updates only the Notion `Apple Reminder ID`, the SQLite `apple_reminder_id`, and refreshed snapshots.
+- Refuses non-test lists, ambiguous title candidates, multiple recoveries by default, and non-`[SYNC TEST]` rows.
 
-Done when: identifier loss does not create duplicates or cancel the Notion row.
+Done when: identifier loss does not create duplicates or cancel the Notion row, final recovery plan reports `NOOP: 2`, and final update plan reports `NOOP: 2`.
 
 ### Milestone 7: UI And Scheduling
 
@@ -509,7 +512,7 @@ The strategy graduates from design to production only when all gates pass:
 - Gate E: closed for the test slice. Bidirectional edits converge to unchanged after a second sync.
 - Gate F: closed for the test slice. Completion status converges both ways.
 - Gate G: mostly closed for the test slice. Timed, all-day, and cleared due dates converge both ways; broader DST boundary coverage remains future hardening.
-- Gate H: open. Lost Apple identifier simulation is not implemented yet.
+- Gate H: closed for the test slice. Lost Apple identifier simulation recovers one stale Notion receipt and repeated recovery is a no-op.
 - Gate I: open. Notion 429 retry handling is not tested yet.
 - Gate J: open. Deletion/cancellation grace policy is not tested yet.
 
@@ -524,11 +527,14 @@ Until those pass, the app must default to dry-run or test-slice mode.
 - `914f774`: Add Apple to Notion test-slice sync.
 - `7508382`: Add Notion reminders bidirectional update sync.
 - `634213f`: Add Notion reminders field proof command.
+- `214ec2a`: Add Notion reminders identity recovery.
 
 Milestone 5D live proof matrix was run against `Notion Sync Test` for all seven supported fields in both directions. The final live update plan reported `NOOP: 2` with all other action counts at `0`.
 
+Milestone 6 live proof was run against `Notion Sync Test`. The proof patched one `[SYNC TEST]` row to `MILESTONE-6-STALE-ID`, recovered the original Apple Reminder ID, recovered `1` row on the first apply, recovered `0` rows on the second apply, and finished with recovery counts `NOOP: 2`, `RECOVER_APPLE_ID: 0`, `UNRECOVERED: 0`; final update counts were `NOOP: 2` with all other action counts at `0`.
+
 ## Next Concrete Step
 
-Implement Milestone 6, not production-list sync:
+Implement Gate I or Gate J, not production-list sync:
 
-Add identity recovery for lost Apple local identifiers, then prove it does not duplicate, cancel, or rewrite the disposable Notion rows. Keep Notion 429 retry handling and deletion/cancellation grace policy explicitly open until they get their own proof gates.
+Add Notion 429 retry handling or deletion/cancellation grace policy proofs. Production-list sync remains blocked until both gates are explicitly closed.
