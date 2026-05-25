@@ -658,6 +658,7 @@ class RemindersAdapter:
         priority: int | None = None,
         due_date: datetime | None = None,
         is_all_day: bool | None = None,
+        clear_due_date: bool = False,
         alarms: list[ReminderAlarm] | None = None,
         recurrence_rules: list[ReminderRecurrence] | None = None,
         url: str | None = None,
@@ -687,7 +688,9 @@ class RemindersAdapter:
             reminder.setPriority_(priority)
 
         # Update due date
-        if due_date is not None:
+        if clear_due_date:
+            reminder.setDueDateComponents_(None)
+        elif due_date is not None:
             from Foundation import NSCalendar, NSDateComponents, NSTimeZone
 
             components = NSDateComponents.alloc().init()

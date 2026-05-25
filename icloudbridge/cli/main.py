@@ -3,6 +3,7 @@
 import asyncio
 import sys
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -22,10 +23,15 @@ from icloudbridge.core.sync import NotesSyncEngine
 from icloudbridge.core.notion_reminders_readonly import (
     CreateApplePartialFailure,
     CreateNotionPartialFailure,
+    build_apple_snapshot,
+    build_bidirectional_update_plan,
+    build_notion_snapshot,
     build_readonly_match_report,
     build_readonly_sync_plan,
     execute_create_apple_plan,
     execute_create_notion_plan,
+    execute_update_apple_plan,
+    execute_update_notion_plan,
 )
 from icloudbridge.sources.reminders.notion_adapter import (
     DEFAULT_NOTION_API_VERSION,
@@ -2012,6 +2018,353 @@ def reminders_notion_create_notion(
             return False
 
     passed = asyncio.run(run_create_notion())
+    if not passed:
+        raise typer.Exit(1)
+
+
+def _date_label(value) -> str:
+    if value is None:
+        return ""
+    return value.isoformat()
+
+
+def _print_update_plan(title: str, update_plan) -> None:
+    summary = Table(title=title)
+    summary.add_column("Action", style="cyan")
+    summary.add_column("Count", style="green", justify="right")
+    for kind in ("NOOP", "NEEDS_BASELINE", "UPDATE_APPLE", "UPDATE_NOTION", "CONFLICT"):
+        summary.add_row(kind, str(update_plan.counts[kind]))
+    console.print(summary)
+
+    actions_table = Table(title="Planned Update Actions")
+    actions_table.add_column("Action", style="cyan")
+    actions_table.add_column("Direction")
+    actions_table.add_column("Title")
+    actions_table.add_column("Status")
+    actions_table.add_column("Due")
+    actions_table.add_column("Changed Fields")
+    actions_table.add_column("Source ID")
+    for action in update_plan.actions:
+        actions_table.add_row(
+            action.kind,
+            action.direction,
+            action.title,
+            action.status,
+            _date_label(action.due_date),
+            ", ".join(action.changed_fields),
+            action.source_id,
+        )
+    console.print(actions_table)
+
+
+async def _read_notion_update_plan(
+    data_source_id: str,
+    apple_calendar: str,
+    notion_token: str | None,
+    api_version: str,
+    notion_page_size: int,
+    db_path: Path,
+):
+    from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+    from icloudbridge.utils.db import NotionRemindersDB
+
+    token = load_notion_token(notion_token)
+    notion = NotionTasksAdapter(token=token, api_version=api_version)
+    report = await notion.preflight_schema(data_source_id)
+    if not report.ok:
+        _print_notion_schema_report(report)
+        return None, None, None, None
+
+    notion_tasks = await notion.query_tasks_with_apple_sync_id(
+        data_source_id=data_source_id,
+        page_size=notion_page_size,
+    )
+    reminders = RemindersAdapter()
+    if not await reminders.request_access():
+        console.print("[red]Apple Reminders access was not granted.[/red]")
+        return None, None, None, None
+
+    calendars = await reminders.list_calendars()
+    target_calendar = next((cal for cal in calendars if cal.title == apple_calendar), None)
+    if not target_calendar:
+        console.print(f"[red]Apple Reminders list not found:[/red] {apple_calendar!r}")
+        return None, None, None, None
+
+    apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+    match_report = build_readonly_match_report(notion_tasks, apple_reminders)
+    db = NotionRemindersDB(db_path)
+    await db.initialize()
+    mappings = await db.get_all_notion_reminder_mappings()
+    update_plan = build_bidirectional_update_plan(match_report, mappings)
+    return update_plan, notion, reminders, db
+
+
+@reminders_app.command("notion-update-plan")
+def reminders_notion_update_plan(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(
+        DEFAULT_TASKS_DATA_SOURCE_ID,
+        "--data-source-id",
+        help="Notion Tasks data source ID to read",
+    ),
+    apple_calendar: str = typer.Option(
+        "Notion Sync Test",
+        "--apple-calendar",
+        "-a",
+        help="Apple Reminders list to compare",
+    ),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+        help="Notion API token. Defaults to NOTION_API_TOKEN or ntn file auth.",
+    ),
+    api_version: str = typer.Option(
+        DEFAULT_NOTION_API_VERSION,
+        "--notion-version",
+        help="Notion API version header",
+    ),
+    notion_page_size: int = typer.Option(
+        100,
+        "--notion-page-size",
+        min=1,
+        max=100,
+        help="Notion page size for the enrolled-row read",
+    ),
+    write_baseline: bool = typer.Option(
+        False,
+        "--write-baseline",
+        help="Write snapshot baselines for matched rows only",
+    ),
+) -> None:
+    """Print Milestone 5 matched-row update actions, optionally writing baselines."""
+
+    async def run_update_plan() -> bool:
+        if write_baseline and apple_calendar != "Notion Sync Test":
+            console.print(
+                "[red]Refusing to write baseline:[/red] Milestone 5 baselines are "
+                "limited to 'Notion Sync Test'."
+            )
+            return False
+        try:
+            update_plan, _, _, db = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+        except NotionAuthError as exc:
+            console.print(f"[red]Notion auth failed:[/red] {exc}")
+            return False
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            console.print(
+                f"[red]Notion update planning read failed:[/red] "
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+            return False
+        except Exception as exc:
+            console.print(f"[red]Update planning failed:[/red] {exc}")
+            return False
+
+        if update_plan is None or db is None:
+            return False
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                f"[yellow]Warning:[/yellow] planning against non-test list "
+                f"{apple_calendar!r}; this command is read-only."
+            )
+        _print_update_plan("Milestone 5A Update Plan", update_plan)
+
+        if write_baseline:
+            count = 0
+            for action in update_plan.actions:
+                if action.notion_task is None or action.apple_reminder is None:
+                    continue
+                await db.update_notion_reminder_snapshots(
+                    apple_sync_id=action.notion_task.apple_sync_id
+                    or (action.mapping or {}).get("apple_sync_id")
+                    or action.notion_task.page_id,
+                    notion_snapshot=build_notion_snapshot(action.notion_task),
+                    apple_snapshot=build_apple_snapshot(action.apple_reminder),
+                    timestamp=datetime.now(timezone.utc),
+                )
+                count += 1
+            console.print(f"\n[green]Wrote {count} matched-row snapshot baselines.[/green]")
+        else:
+            console.print(
+                "\n[green]Milestone 5A update plan completed.[/green]\n"
+                "[dim]No Notion fields or Apple reminders were updated.[/dim]"
+            )
+        return True
+
+    passed = asyncio.run(run_update_plan())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-update-apple")
+def reminders_notion_update_apple(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    apply: bool = typer.Option(False, "--apply", help="Actually update Apple reminders"),
+    allow_multiple_test_updates: bool = typer.Option(
+        False,
+        "--allow-multiple-test-updates",
+        help="Allow more than one UPDATE_APPLE action in the test list",
+    ),
+) -> None:
+    """Apply Notion-to-Apple update actions, gated by --apply."""
+
+    async def run_update_apple() -> bool:
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                "[red]Refusing to run:[/red] Milestone 5 Apple updates are limited to "
+                "'Notion Sync Test'."
+            )
+            return False
+        try:
+            update_plan, _, reminders, db = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if update_plan is None or reminders is None or db is None:
+                return False
+            _print_update_plan("Milestone 5B Notion → Apple Update Plan", update_plan)
+            if not apply:
+                console.print(
+                    "\n[yellow]Dry run only.[/yellow] Pass --apply to update Apple reminders."
+                )
+                return True
+            result = await execute_update_apple_plan(
+                update_plan,
+                apple_calendar_name=apple_calendar,
+                reminders_adapter=reminders,
+                db=db,
+                allow_multiple_test_updates=allow_multiple_test_updates,
+            )
+            result_table = Table(title="Milestone 5B Apply Result")
+            result_table.add_column("Metric", style="cyan")
+            result_table.add_column("Count", style="green", justify="right")
+            result_table.add_row("Updated Apple reminders", str(result.updated_apple))
+            result_table.add_row(
+                "Skipped non-UPDATE_APPLE actions",
+                str(result.skipped_non_update_apple),
+            )
+            console.print(result_table)
+            post_plan, _, _, _ = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if post_plan is None:
+                return False
+            _print_update_plan("Post-Apply Update Plan", post_plan)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Notion-to-Apple update failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_update_apple())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-update-notion")
+def reminders_notion_update_notion(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    apply: bool = typer.Option(False, "--apply", help="Actually update Notion rows"),
+    allow_multiple_test_updates: bool = typer.Option(
+        False,
+        "--allow-multiple-test-updates",
+        help="Allow more than one UPDATE_NOTION action in the test list",
+    ),
+) -> None:
+    """Apply Apple-to-Notion update actions, gated by --apply."""
+
+    async def run_update_notion() -> bool:
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                "[red]Refusing to run:[/red] Milestone 5 Notion updates are limited to "
+                "'Notion Sync Test'."
+            )
+            return False
+        try:
+            update_plan, notion, _, db = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if update_plan is None or notion is None or db is None:
+                return False
+            _print_update_plan("Milestone 5C Apple → Notion Update Plan", update_plan)
+            if not apply:
+                console.print(
+                    "\n[yellow]Dry run only.[/yellow] Pass --apply to update Notion rows."
+                )
+                return True
+            result = await execute_update_notion_plan(
+                update_plan,
+                apple_calendar_name=apple_calendar,
+                notion_adapter=notion,
+                db=db,
+                allow_multiple_test_updates=allow_multiple_test_updates,
+            )
+            result_table = Table(title="Milestone 5C Apply Result")
+            result_table.add_column("Metric", style="cyan")
+            result_table.add_column("Count", style="green", justify="right")
+            result_table.add_row("Updated Notion rows", str(result.updated_notion))
+            result_table.add_row(
+                "Skipped non-UPDATE_NOTION actions",
+                str(result.skipped_non_update_notion),
+            )
+            console.print(result_table)
+            post_plan, _, _, _ = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if post_plan is None:
+                return False
+            _print_update_plan("Post-Apply Update Plan", post_plan)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Apple-to-Notion update failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_update_notion())
     if not passed:
         raise typer.Exit(1)
 

@@ -591,6 +591,20 @@ class NotionRemindersDB:
                 """
             )
             await db.commit()
+            db.row_factory = aiosqlite.Row
+            async with db.execute("PRAGMA table_info(notion_reminder_mapping)") as cursor:
+                columns = {row["name"] for row in await cursor.fetchall()}
+            for column in (
+                "last_notion_snapshot_hash",
+                "last_apple_snapshot_hash",
+                "last_notion_snapshot_json",
+                "last_apple_snapshot_json",
+            ):
+                if column not in columns:
+                    await db.execute(
+                        f"ALTER TABLE notion_reminder_mapping ADD COLUMN {column} TEXT"
+                    )
+            await db.commit()
             logger.debug(f"Notion reminders database initialized at {self.db_path}")
 
     async def upsert_notion_reminder_mapping(
@@ -651,6 +665,63 @@ class NotionRemindersDB:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def get_notion_mapping_by_apple_reminder_id(
+        self, apple_reminder_id: str
+    ) -> dict | None:
+        """Get a Notion reminder mapping by Apple Reminder ID."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT * FROM notion_reminder_mapping
+                WHERE apple_reminder_id = ?
+                """,
+                (apple_reminder_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_all_notion_reminder_mappings(self) -> list[dict]:
+        """Get all Notion reminder mappings."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM notion_reminder_mapping") as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def update_notion_reminder_snapshots(
+        self,
+        apple_sync_id: str,
+        notion_snapshot: dict,
+        apple_snapshot: dict,
+        timestamp: datetime,
+    ) -> None:
+        """Update snapshot receipts for an existing Notion reminder mapping."""
+        from icloudbridge.core.notion_reminders_readonly import snapshot_hash
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE notion_reminder_mapping
+                SET
+                    last_notion_snapshot_hash = ?,
+                    last_apple_snapshot_hash = ?,
+                    last_notion_snapshot_json = ?,
+                    last_apple_snapshot_json = ?,
+                    updated_at = ?
+                WHERE apple_sync_id = ?
+                """,
+                (
+                    snapshot_hash(notion_snapshot),
+                    snapshot_hash(apple_snapshot),
+                    json.dumps(notion_snapshot, sort_keys=True),
+                    json.dumps(apple_snapshot, sort_keys=True),
+                    timestamp.isoformat(),
+                    apple_sync_id,
+                ),
+            )
+            await db.commit()
 
 
 class PasswordsDB:

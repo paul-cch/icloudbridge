@@ -241,6 +241,35 @@ def build_apple_origin_task_properties(
     return properties
 
 
+def build_task_update_from_apple_properties(
+    title: str,
+    notes: str | None,
+    completed: bool,
+    notion_priority: str | None,
+    due_date: datetime | None,
+    due_is_all_day: bool,
+) -> dict[str, Any]:
+    """Build a narrow Notion page patch from an Apple reminder."""
+    properties: dict[str, Any] = {
+        "Task Name": {"title": [{"text": {"content": title}}]},
+        "Notes": _rich_text(notes) if notes else {"rich_text": []},
+        "Status": {"status": {"name": "Done" if completed else "Not started"}},
+    }
+    if notion_priority:
+        properties["Priority"] = {"select": {"name": notion_priority}}
+    if due_date:
+        properties["Due Date"] = {
+            "date": {
+                "start": due_date.date().isoformat()
+                if due_is_all_day
+                else due_date.isoformat()
+            }
+        }
+    else:
+        properties["Due Date"] = {"date": None}
+    return properties
+
+
 def build_notes_patch(notes: str) -> dict[str, Any]:
     """Build a Notion page property patch for the Notes field."""
     return {"Notes": _rich_text(notes)}
@@ -496,6 +525,35 @@ class NotionTasksAdapter:
                 f"{self.base_url}/v1/pages/{page_id}",
                 headers=self._headers(),
                 json={"properties": build_apple_reminder_id_patch(apple_reminder_id)},
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def update_task_from_apple(
+        self,
+        page_id: str,
+        title: str,
+        notes: str | None,
+        completed: bool,
+        notion_priority: str | None,
+        due_date: datetime | None,
+        due_is_all_day: bool,
+    ) -> dict[str, Any]:
+        """Update safe task fields on a Notion page from an Apple reminder."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.patch(
+                f"{self.base_url}/v1/pages/{page_id}",
+                headers=self._headers(),
+                json={
+                    "properties": build_task_update_from_apple_properties(
+                        title=title,
+                        notes=notes,
+                        completed=completed,
+                        notion_priority=notion_priority,
+                        due_date=due_date,
+                        due_is_all_day=due_is_all_day,
+                    )
+                },
             )
             response.raise_for_status()
             return response.json()
