@@ -19,7 +19,10 @@ from icloudbridge.core.photos_sync import PhotoSyncEngine
 from icloudbridge.core.reminders_sync import RemindersSyncEngine
 from icloudbridge.core.rich_notes_export import RichNotesExporter
 from icloudbridge.core.sync import NotesSyncEngine
-from icloudbridge.core.notion_reminders_readonly import build_readonly_match_report
+from icloudbridge.core.notion_reminders_readonly import (
+    build_readonly_match_report,
+    build_readonly_sync_plan,
+)
 from icloudbridge.sources.reminders.notion_adapter import (
     DEFAULT_NOTION_API_VERSION,
     DEFAULT_TASKS_DATA_SOURCE_ID,
@@ -1482,6 +1485,140 @@ def reminders_notion_readonly(
         return True
 
     passed = asyncio.run(run_readonly())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-plan")
+def reminders_notion_plan(
+    data_source_id: str = typer.Option(
+        DEFAULT_TASKS_DATA_SOURCE_ID,
+        "--data-source-id",
+        help="Notion Tasks data source ID to read",
+    ),
+    apple_calendar: str = typer.Option(
+        "Notion Sync Test",
+        "--apple-calendar",
+        "-a",
+        help="Apple Reminders list to compare",
+    ),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+        help="Notion API token. Defaults to NOTION_API_TOKEN or ntn file auth.",
+    ),
+    api_version: str = typer.Option(
+        DEFAULT_NOTION_API_VERSION,
+        "--notion-version",
+        help="Notion API version header",
+    ),
+    notion_page_size: int = typer.Option(
+        100,
+        "--notion-page-size",
+        min=1,
+        max=100,
+        help="Notion page size for the enrolled-row read",
+    ),
+) -> None:
+    """Print dry-run Notion ↔ Apple reminder actions without writes."""
+
+    def date_label(value) -> str:
+        if value is None:
+            return ""
+        return value.isoformat()
+
+    async def run_plan() -> bool:
+        from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+
+        try:
+            token = load_notion_token(notion_token)
+        except NotionAuthError as exc:
+            console.print(f"[red]Notion auth failed:[/red] {exc}")
+            return False
+
+        notion = NotionTasksAdapter(token=token, api_version=api_version)
+
+        try:
+            report = await notion.preflight_schema(data_source_id)
+            if not report.ok:
+                _print_notion_schema_report(report)
+                return False
+            notion_tasks = await notion.query_tasks_with_apple_sync_id(
+                data_source_id=data_source_id,
+                page_size=notion_page_size,
+            )
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            console.print(
+                f"[red]Notion planning read failed:[/red] "
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+            return False
+        except httpx.HTTPError as exc:
+            console.print(f"[red]Notion planning read failed:[/red] {exc}")
+            return False
+
+        try:
+            reminders = RemindersAdapter()
+            if not await reminders.request_access():
+                console.print("[red]Apple Reminders access was not granted.[/red]")
+                return False
+
+            calendars = await reminders.list_calendars()
+            target_calendar = next((cal for cal in calendars if cal.title == apple_calendar), None)
+            if not target_calendar:
+                console.print(
+                    f"[red]Apple Reminders list not found:[/red] {apple_calendar!r}"
+                )
+                return False
+            apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+        except Exception as exc:
+            console.print(f"[red]Apple planning read failed:[/red] {exc}")
+            return False
+
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                f"[yellow]Warning:[/yellow] planning against non-test list "
+                f"{apple_calendar!r}; this command is still read-only."
+            )
+
+        match_report = build_readonly_match_report(notion_tasks, apple_reminders)
+        sync_plan = build_readonly_sync_plan(match_report)
+
+        summary = Table(title="Milestone 2 Dry-Run Plan Summary")
+        summary.add_column("Action", style="cyan")
+        summary.add_column("Count", style="green", justify="right")
+        for kind in ("NOOP", "CREATE_APPLE", "CREATE_NOTION"):
+            summary.add_row(kind, str(sync_plan.counts[kind]))
+        console.print(summary)
+
+        actions_table = Table(title="Planned Actions")
+        actions_table.add_column("Action", style="cyan")
+        actions_table.add_column("Direction")
+        actions_table.add_column("Title")
+        actions_table.add_column("Status/Completed")
+        actions_table.add_column("Due")
+        actions_table.add_column("Source ID")
+        for action in sync_plan.actions:
+            actions_table.add_row(
+                action.kind,
+                action.direction,
+                action.title,
+                action.status,
+                date_label(action.due_date),
+                action.source_id,
+            )
+        console.print(actions_table)
+
+        console.print(
+            "\n[green]Milestone 2 dry-run plan completed.[/green]\n"
+            "[dim]No Notion pages or Apple reminders were created, updated, completed, "
+            "cancelled, or deleted.[/dim]"
+        )
+        return True
+
+    passed = asyncio.run(run_plan())
     if not passed:
         raise typer.Exit(1)
 

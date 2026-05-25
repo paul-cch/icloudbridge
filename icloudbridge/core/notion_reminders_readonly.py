@@ -26,6 +26,38 @@ class ReadOnlyMatchReport:
     apple_only: list[Any] = field(default_factory=list)
 
 
+@dataclass
+class PlannedAction:
+    """A proposed dry-run sync action."""
+
+    kind: str
+    direction: str
+    title: str
+    status: str
+    due_date: Any
+    source_id: str
+
+
+@dataclass
+class ReadOnlySyncPlan:
+    """Dry-run action plan for Notion and Apple reminders."""
+
+    actions: list[PlannedAction] = field(default_factory=list)
+
+    @property
+    def counts(self) -> dict[str, int]:
+        """Count planned actions by kind."""
+        return {
+            "NOOP": sum(1 for action in self.actions if action.kind == "NOOP"),
+            "CREATE_APPLE": sum(
+                1 for action in self.actions if action.kind == "CREATE_APPLE"
+            ),
+            "CREATE_NOTION": sum(
+                1 for action in self.actions if action.kind == "CREATE_NOTION"
+            ),
+        }
+
+
 def build_readonly_match_report(
     notion_tasks: list[NotionTask],
     apple_reminders: list[Any],
@@ -69,3 +101,47 @@ def build_readonly_match_report(
 
     report.apple_only = remaining_apple
     return report
+
+
+def build_readonly_sync_plan(match_report: ReadOnlyMatchReport) -> ReadOnlySyncPlan:
+    """Build a dry-run plan from read-only match buckets."""
+    actions: list[PlannedAction] = []
+
+    for match in match_report.matched:
+        actions.append(
+            PlannedAction(
+                kind="NOOP",
+                direction="both",
+                title=match.notion_task.title,
+                status=match.notion_task.status,
+                due_date=match.notion_task.due_date,
+                source_id=match.notion_task.apple_reminder_id
+                or getattr(match.apple_reminder, "uuid", ""),
+            )
+        )
+
+    for task in match_report.notion_only:
+        actions.append(
+            PlannedAction(
+                kind="CREATE_APPLE",
+                direction="notion_to_apple",
+                title=task.title,
+                status=task.status,
+                due_date=task.due_date,
+                source_id=task.apple_sync_id or task.page_id,
+            )
+        )
+
+    for reminder in match_report.apple_only:
+        actions.append(
+            PlannedAction(
+                kind="CREATE_NOTION",
+                direction="apple_to_notion",
+                title=getattr(reminder, "title", ""),
+                status="completed" if getattr(reminder, "completed", False) else "open",
+                due_date=getattr(reminder, "due_date", None),
+                source_id=getattr(reminder, "uuid", ""),
+            )
+        )
+
+    return ReadOnlySyncPlan(actions=actions)
