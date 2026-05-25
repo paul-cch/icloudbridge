@@ -215,6 +215,11 @@ def build_notes_patch(notes: str) -> dict[str, Any]:
     return {"Notes": _rich_text(notes)}
 
 
+def build_apple_reminder_id_patch(apple_reminder_id: str) -> dict[str, Any]:
+    """Build a Notion page property patch for the Apple Reminder ID receipt."""
+    return {"Apple Reminder ID": _rich_text(apple_reminder_id)}
+
+
 def plain_text_from_property(prop: dict[str, Any] | None) -> str:
     """Extract plain text from a Notion title or rich_text property."""
     if not isinstance(prop, dict):
@@ -412,6 +417,19 @@ class NotionTasksAdapter:
                 f"{self.base_url}/v1/pages/{page_id}",
                 headers=self._headers(),
                 json={"properties": build_notes_patch(notes)},
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def update_page_apple_reminder_id(
+        self, page_id: str, apple_reminder_id: str
+    ) -> dict[str, Any]:
+        """Update only the Apple Reminder ID property on a Notion page."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.patch(
+                f"{self.base_url}/v1/pages/{page_id}",
+                headers=self._headers(),
+                json={"properties": build_apple_reminder_id_patch(apple_reminder_id)},
             )
             response.raise_for_status()
             return response.json()

@@ -20,8 +20,10 @@ from icloudbridge.core.reminders_sync import RemindersSyncEngine
 from icloudbridge.core.rich_notes_export import RichNotesExporter
 from icloudbridge.core.sync import NotesSyncEngine
 from icloudbridge.core.notion_reminders_readonly import (
+    CreateApplePartialFailure,
     build_readonly_match_report,
     build_readonly_sync_plan,
+    execute_create_apple_plan,
 )
 from icloudbridge.sources.reminders.notion_adapter import (
     DEFAULT_NOTION_API_VERSION,
@@ -1619,6 +1621,203 @@ def reminders_notion_plan(
         return True
 
     passed = asyncio.run(run_plan())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-create-apple")
+def reminders_notion_create_apple(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(
+        DEFAULT_TASKS_DATA_SOURCE_ID,
+        "--data-source-id",
+        help="Notion Tasks data source ID to read",
+    ),
+    apple_calendar: str = typer.Option(
+        "Notion Sync Test",
+        "--apple-calendar",
+        "-a",
+        help="Apple Reminders list to create into",
+    ),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+        help="Notion API token. Defaults to NOTION_API_TOKEN or ntn file auth.",
+    ),
+    api_version: str = typer.Option(
+        DEFAULT_NOTION_API_VERSION,
+        "--notion-version",
+        help="Notion API version header",
+    ),
+    notion_page_size: int = typer.Option(
+        100,
+        "--notion-page-size",
+        min=1,
+        max=100,
+        help="Notion page size for the enrolled-row read",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Actually create Apple reminders for CREATE_APPLE actions",
+    ),
+    allow_multiple_test_creates: bool = typer.Option(
+        False,
+        "--allow-multiple-test-creates",
+        help="Allow more than one CREATE_APPLE action in the Notion Sync Test list",
+    ),
+) -> None:
+    """Create Apple reminders from Notion test-slice rows, gated by --apply."""
+
+    def date_label(value) -> str:
+        if value is None:
+            return ""
+        return value.isoformat()
+
+    def print_sync_plan(title: str, sync_plan) -> None:
+        summary = Table(title=title)
+        summary.add_column("Action", style="cyan")
+        summary.add_column("Count", style="green", justify="right")
+        for kind in ("NOOP", "CREATE_APPLE", "CREATE_NOTION"):
+            summary.add_row(kind, str(sync_plan.counts[kind]))
+        console.print(summary)
+
+        actions_table = Table(title="Planned Actions")
+        actions_table.add_column("Action", style="cyan")
+        actions_table.add_column("Direction")
+        actions_table.add_column("Title")
+        actions_table.add_column("Status/Completed")
+        actions_table.add_column("Due")
+        actions_table.add_column("Source ID")
+        for action in sync_plan.actions:
+            actions_table.add_row(
+                action.kind,
+                action.direction,
+                action.title,
+                action.status,
+                date_label(action.due_date),
+                action.source_id,
+            )
+        console.print(actions_table)
+
+    async def read_plan(notion, reminders):
+        report = await notion.preflight_schema(data_source_id)
+        if not report.ok:
+            _print_notion_schema_report(report)
+            return None, None
+
+        notion_tasks = await notion.query_tasks_with_apple_sync_id(
+            data_source_id=data_source_id,
+            page_size=notion_page_size,
+        )
+
+        if not await reminders.request_access():
+            console.print("[red]Apple Reminders access was not granted.[/red]")
+            return None, None
+
+        calendars = await reminders.list_calendars()
+        target_calendar = next((cal for cal in calendars if cal.title == apple_calendar), None)
+        if not target_calendar:
+            console.print(f"[red]Apple Reminders list not found:[/red] {apple_calendar!r}")
+            return None, None
+
+        apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+        match_report = build_readonly_match_report(notion_tasks, apple_reminders)
+        return target_calendar, build_readonly_sync_plan(match_report)
+
+    async def run_create_apple() -> bool:
+        from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+        from icloudbridge.utils.db import NotionRemindersDB
+
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                "[red]Refusing to run:[/red] Milestone 3 writes are limited to "
+                "'Notion Sync Test'."
+            )
+            return False
+
+        try:
+            token = load_notion_token(notion_token)
+        except NotionAuthError as exc:
+            console.print(f"[red]Notion auth failed:[/red] {exc}")
+            return False
+
+        notion = NotionTasksAdapter(token=token, api_version=api_version)
+        reminders = RemindersAdapter()
+
+        try:
+            target_calendar, sync_plan = await read_plan(notion, reminders)
+            if target_calendar is None or sync_plan is None:
+                return False
+            print_sync_plan("Milestone 3 Notion → Apple Plan", sync_plan)
+
+            if not apply:
+                console.print(
+                    "\n[yellow]Dry run only.[/yellow] Pass --apply to create Apple reminders.\n"
+                    "[dim]No Notion pages or Apple reminders were created, updated, "
+                    "completed, cancelled, or deleted.[/dim]"
+                )
+                return True
+
+            db = NotionRemindersDB(ctx.obj["config"].reminders_db_path)
+            await db.initialize()
+            result = await execute_create_apple_plan(
+                sync_plan,
+                apple_calendar_name=apple_calendar,
+                apple_calendar_id=target_calendar.uuid,
+                reminders_adapter=reminders,
+                notion_adapter=notion,
+                db=db,
+                allow_multiple_test_creates=allow_multiple_test_creates,
+            )
+
+            result_table = Table(title="Milestone 3 Apply Result")
+            result_table.add_column("Metric", style="cyan")
+            result_table.add_column("Count", style="green", justify="right")
+            result_table.add_row("Created Apple reminders", str(result.created_apple))
+            result_table.add_row(
+                "Skipped existing Apple Reminder ID",
+                str(result.skipped_existing_receipt),
+            )
+            result_table.add_row(
+                "Skipped non-CREATE_APPLE actions",
+                str(result.skipped_non_create_apple),
+            )
+            console.print(result_table)
+
+            _, post_plan = await read_plan(notion, reminders)
+            if post_plan is None:
+                return False
+            print_sync_plan("Post-Apply Plan", post_plan)
+            console.print(
+                "\n[green]Milestone 3 Notion → Apple apply completed.[/green]\n"
+                "[dim]Only CREATE_APPLE actions for Notion Sync Test were eligible "
+                "for writes.[/dim]"
+            )
+            return True
+
+        except CreateApplePartialFailure as exc:
+            console.print(f"[red]Partial success:[/red] {exc}")
+            return False
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            console.print(
+                f"[red]Notion create-Apple sync failed:[/red] "
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+            return False
+        except httpx.HTTPError as exc:
+            console.print(f"[red]Notion create-Apple sync failed:[/red] {exc}")
+            return False
+        except ValueError as exc:
+            console.print(f"[red]Refusing to apply:[/red] {exc}")
+            return False
+        except Exception as exc:
+            console.print(f"[red]Notion create-Apple sync failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_create_apple())
     if not passed:
         raise typer.Exit(1)
 

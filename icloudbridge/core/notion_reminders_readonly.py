@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from icloudbridge.sources.reminders.notion_adapter import NotionTask
@@ -36,6 +37,8 @@ class PlannedAction:
     status: str
     due_date: Any
     source_id: str
+    notion_task: NotionTask | None = None
+    apple_reminder: Any | None = None
 
 
 @dataclass
@@ -56,6 +59,30 @@ class ReadOnlySyncPlan:
                 1 for action in self.actions if action.kind == "CREATE_NOTION"
             ),
         }
+
+
+@dataclass
+class CreateAppleExecutionResult:
+    """Stats from applying CREATE_APPLE actions."""
+
+    created_apple: int = 0
+    skipped_existing_receipt: int = 0
+    skipped_non_create_apple: int = 0
+
+
+class CreateApplePartialFailure(RuntimeError):
+    """Raised after Apple creation succeeds but identity persistence fails."""
+
+
+def map_notion_priority_to_apple(priority: str | None) -> int:
+    """Map Notion priority names to conservative Apple priority values."""
+    if priority == "High":
+        return 1
+    if priority == "Medium":
+        return 5
+    if priority == "Low":
+        return 9
+    return 0
 
 
 def build_readonly_match_report(
@@ -117,6 +144,8 @@ def build_readonly_sync_plan(match_report: ReadOnlyMatchReport) -> ReadOnlySyncP
                 due_date=match.notion_task.due_date,
                 source_id=match.notion_task.apple_reminder_id
                 or getattr(match.apple_reminder, "uuid", ""),
+                notion_task=match.notion_task,
+                apple_reminder=match.apple_reminder,
             )
         )
 
@@ -129,6 +158,7 @@ def build_readonly_sync_plan(match_report: ReadOnlyMatchReport) -> ReadOnlySyncP
                 status=task.status,
                 due_date=task.due_date,
                 source_id=task.apple_sync_id or task.page_id,
+                notion_task=task,
             )
         )
 
@@ -141,7 +171,67 @@ def build_readonly_sync_plan(match_report: ReadOnlyMatchReport) -> ReadOnlySyncP
                 status="completed" if getattr(reminder, "completed", False) else "open",
                 due_date=getattr(reminder, "due_date", None),
                 source_id=getattr(reminder, "uuid", ""),
+                apple_reminder=reminder,
             )
         )
 
     return ReadOnlySyncPlan(actions=actions)
+
+
+async def execute_create_apple_plan(
+    plan: ReadOnlySyncPlan,
+    apple_calendar_name: str,
+    apple_calendar_id: str,
+    reminders_adapter: Any,
+    notion_adapter: Any,
+    db: Any,
+    allow_multiple_test_creates: bool = False,
+) -> CreateAppleExecutionResult:
+    """Execute only CREATE_APPLE actions for the dedicated Notion test slice."""
+    if apple_calendar_name != "Notion Sync Test":
+        raise ValueError("Milestone 3 can only write to the 'Notion Sync Test' list")
+
+    create_actions = [action for action in plan.actions if action.kind == "CREATE_APPLE"]
+    if len(create_actions) > 1 and not allow_multiple_test_creates:
+        raise ValueError("Refusing multiple CREATE_APPLE actions without explicit opt-in")
+
+    result = CreateAppleExecutionResult(
+        skipped_non_create_apple=len(plan.actions) - len(create_actions)
+    )
+
+    for action in create_actions:
+        task = action.notion_task
+        if task is None:
+            continue
+        if task.apple_reminder_id:
+            result.skipped_existing_receipt += 1
+            continue
+
+        created = await reminders_adapter.create_reminder(
+            calendar_id=apple_calendar_id,
+            title=task.title,
+            notes=task.notes,
+            completed=task.completed,
+            priority=map_notion_priority_to_apple(task.priority),
+            due_date=task.due_date,
+            is_all_day=task.due_is_all_day,
+        )
+
+        try:
+            await notion_adapter.update_page_apple_reminder_id(task.page_id, created.uuid)
+            await db.upsert_notion_reminder_mapping(
+                apple_sync_id=task.apple_sync_id or task.page_id,
+                notion_page_id=task.page_id,
+                apple_reminder_id=created.uuid,
+                apple_calendar_name=apple_calendar_name,
+                timestamp=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            raise CreateApplePartialFailure(
+                "Apple reminder was created, but Notion/SQLite identity persistence failed. "
+                "Rerun notion-plan before applying again."
+            ) from exc
+
+        result.created_apple += 1
+
+    return result

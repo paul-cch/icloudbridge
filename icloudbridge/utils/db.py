@@ -543,6 +543,116 @@ class RemindersDB:
             self._connection = None
 
 
+class NotionRemindersDB:
+    """
+    Manages SQLite mappings for Notion Tasks ↔ Apple Reminders sync.
+
+    This table is separate from the CalDAV reminder_mapping table so the Notion
+    sync can evolve without overloading CalDAV-specific identifiers.
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+
+    async def initialize(self) -> None:
+        """Initialize the Notion reminders mapping table."""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notion_reminder_mapping (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    apple_sync_id TEXT NOT NULL UNIQUE,
+                    notion_page_id TEXT NOT NULL UNIQUE,
+                    apple_reminder_id TEXT NOT NULL UNIQUE,
+                    apple_calendar_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notion_reminder_apple_sync_id
+                ON notion_reminder_mapping(apple_sync_id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notion_reminder_page_id
+                ON notion_reminder_mapping(notion_page_id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notion_reminder_apple_id
+                ON notion_reminder_mapping(apple_reminder_id)
+                """
+            )
+            await db.commit()
+            logger.debug(f"Notion reminders database initialized at {self.db_path}")
+
+    async def upsert_notion_reminder_mapping(
+        self,
+        apple_sync_id: str,
+        notion_page_id: str,
+        apple_reminder_id: str,
+        apple_calendar_name: str,
+        timestamp: datetime,
+    ) -> None:
+        """Create or update a Notion ↔ Apple reminder mapping."""
+        timestamp_text = timestamp.isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO notion_reminder_mapping
+                (
+                    apple_sync_id,
+                    notion_page_id,
+                    apple_reminder_id,
+                    apple_calendar_name,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(apple_sync_id) DO UPDATE SET
+                    notion_page_id = excluded.notion_page_id,
+                    apple_reminder_id = excluded.apple_reminder_id,
+                    apple_calendar_name = excluded.apple_calendar_name,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    apple_sync_id,
+                    notion_page_id,
+                    apple_reminder_id,
+                    apple_calendar_name,
+                    timestamp_text,
+                    timestamp_text,
+                ),
+            )
+            await db.commit()
+            logger.debug(
+                "Upserted Notion reminder mapping: %s -> %s",
+                apple_sync_id,
+                apple_reminder_id,
+            )
+
+    async def get_notion_mapping_by_apple_sync_id(self, apple_sync_id: str) -> dict | None:
+        """Get a Notion reminder mapping by Apple Sync ID."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT * FROM notion_reminder_mapping
+                WHERE apple_sync_id = ?
+                """,
+                (apple_sync_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+
 class PasswordsDB:
     """
     Manages SQLite database for tracking password synchronization state.

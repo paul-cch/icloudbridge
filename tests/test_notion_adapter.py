@@ -6,6 +6,7 @@ from icloudbridge.sources.reminders.notion_adapter import (
     DISPOSABLE_APPLE_TO_NOTION_TITLE,
     DISPOSABLE_NOTION_TO_APPLE_TITLE,
     NotionTasksAdapter,
+    build_apple_reminder_id_patch,
     build_disposable_task_properties,
     build_apple_sync_id_query,
     build_exact_title_query,
@@ -224,4 +225,14 @@ def test_build_apple_sync_id_query_only_reads_enrolled_rows():
             "rich_text": {"is_not_empty": True},
         },
         "page_size": 25,
+    }
+
+
+def test_build_apple_reminder_id_patch_updates_only_identity_receipt():
+    patch = build_apple_reminder_id_patch("apple-id")
+
+    assert patch == {
+        "Apple Reminder ID": {
+            "rich_text": [{"text": {"content": "apple-id"}}],
+        }
     }
