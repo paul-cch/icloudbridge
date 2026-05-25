@@ -13,6 +13,8 @@ import httpx
 
 DEFAULT_NOTION_API_VERSION = "2025-09-03"
 DEFAULT_TASKS_DATA_SOURCE_ID = "61ef2269-1dc6-4391-aaff-8013d2b857e3"
+DISPOSABLE_NOTION_TO_APPLE_TITLE = "[SYNC TEST] Notion to Apple"
+DISPOSABLE_APPLE_TO_NOTION_TITLE = "[SYNC TEST] Apple to Notion"
 
 REQUIRED_TASK_PROPERTIES = {
     "Task Name": "title",
@@ -142,6 +144,67 @@ def load_notion_token(token: str | None = None) -> str:
     )
 
 
+def build_exact_title_query(title: str, page_size: int = 10) -> dict[str, Any]:
+    """Build a narrow query for a Tasks row by exact title."""
+    return {
+        "filter": {
+            "property": "Task Name",
+            "title": {"equals": title},
+        },
+        "page_size": page_size,
+    }
+
+
+def _rich_text(content: str) -> dict[str, Any]:
+    return {"rich_text": [{"text": {"content": content}}]}
+
+
+def build_disposable_task_properties(
+    apple_sync_id: str,
+    notes: str,
+    title: str = DISPOSABLE_NOTION_TO_APPLE_TITLE,
+) -> dict[str, Any]:
+    """Build the approved disposable Notion proof row properties."""
+    return {
+        "Task Name": {"title": [{"text": {"content": title}}]},
+        "Apple Sync ID": _rich_text(apple_sync_id),
+        "Source": {"select": {"name": "Manual"}},
+        "Area": {"select": {"name": "Life"}},
+        "Status": {"status": {"name": "Not started"}},
+        "Notes": _rich_text(notes),
+    }
+
+
+def build_notes_patch(notes: str) -> dict[str, Any]:
+    """Build a Notion page property patch for the Notes field."""
+    return {"Notes": _rich_text(notes)}
+
+
+def plain_text_from_property(prop: dict[str, Any] | None) -> str:
+    """Extract plain text from a Notion title or rich_text property."""
+    if not isinstance(prop, dict):
+        return ""
+    prop_type = prop.get("type")
+    if prop_type not in {"title", "rich_text"}:
+        return ""
+    return "".join(part.get("plain_text", "") for part in prop.get(prop_type, []))
+
+
+def page_title(page: dict[str, Any]) -> str:
+    """Extract the Tasks title from a Notion page payload."""
+    return plain_text_from_property(page.get("properties", {}).get("Task Name"))
+
+
+def page_apple_sync_id(page: dict[str, Any]) -> str:
+    """Extract the Apple Sync ID from a Notion page payload."""
+    return plain_text_from_property(page.get("properties", {}).get("Apple Sync ID"))
+
+
+def page_notes(page: dict[str, Any]) -> str:
+    """Extract Notes from a Notion page payload."""
+    return plain_text_from_property(page.get("properties", {}).get("Notes"))
+
+
 class NotionTasksAdapter:
     """Small Notion API client for preflight checks."""
 
@@ -170,6 +233,65 @@ class NotionTasksAdapter:
             response = await client.get(
                 f"{self.base_url}/v1/data_sources/{data_source_id}",
                 headers=self._headers(),
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def query_tasks_by_title(self, data_source_id: str, title: str) -> list[dict[str, Any]]:
+        """Query Tasks rows by exact title."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/v1/data_sources/{data_source_id}/query",
+                headers=self._headers(),
+                json=build_exact_title_query(title),
+            )
+            response.raise_for_status()
+            return response.json().get("results", [])
+
+    async def create_disposable_task(
+        self,
+        data_source_id: str,
+        apple_sync_id: str,
+        notes: str,
+        title: str = DISPOSABLE_NOTION_TO_APPLE_TITLE,
+    ) -> dict[str, Any]:
+        """Create the approved disposable Notion proof row."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/v1/pages",
+                headers=self._headers(),
+                json={
+                    "parent": {
+                        "type": "data_source_id",
+                        "data_source_id": data_source_id,
+                    },
+                    "properties": build_disposable_task_properties(
+                        apple_sync_id=apple_sync_id,
+                        notes=notes,
+                        title=title,
+                    ),
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def retrieve_page(self, page_id: str) -> dict[str, Any]:
+        """Retrieve a Notion page by ID."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.get(
+                f"{self.base_url}/v1/pages/{page_id}",
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def update_page_notes(self, page_id: str, notes: str) -> dict[str, Any]:
+        """Update only the Notes property on a Notion page."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.patch(
+                f"{self.base_url}/v1/pages/{page_id}",
+                headers=self._headers(),
+                json={"properties": build_notes_patch(notes)},
             )
             response.raise_for_status()
             return response.json()

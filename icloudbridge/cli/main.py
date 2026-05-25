@@ -22,10 +22,15 @@ from icloudbridge.core.sync import NotesSyncEngine
 from icloudbridge.sources.reminders.notion_adapter import (
     DEFAULT_NOTION_API_VERSION,
     DEFAULT_TASKS_DATA_SOURCE_ID,
+    DISPOSABLE_APPLE_TO_NOTION_TITLE,
+    DISPOSABLE_NOTION_TO_APPLE_TITLE,
     NotionAuthError,
     NotionSchemaReport,
     NotionTasksAdapter,
     PropertyCheck,
+    page_apple_sync_id,
+    page_notes,
+    page_title,
     load_notion_token,
 )
 from icloudbridge.utils.logging import setup_logging
@@ -1137,6 +1142,191 @@ def reminders_notion_preflight(
         return ok
 
     passed = asyncio.run(run_preflight())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-proof")
+def reminders_notion_proof(
+    data_source_id: str = typer.Option(
+        DEFAULT_TASKS_DATA_SOURCE_ID,
+        "--data-source-id",
+        help="Notion Tasks data source ID to use for the disposable proof row",
+    ),
+    apple_calendar: str = typer.Option(
+        "Notion Sync Test",
+        "--apple-calendar",
+        "-a",
+        help="Apple Reminders list to use for the disposable proof reminder",
+    ),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+        help="Notion API token. Defaults to NOTION_API_TOKEN or ntn file auth.",
+    ),
+    api_version: str = typer.Option(
+        DEFAULT_NOTION_API_VERSION,
+        "--notion-version",
+        help="Notion API version header",
+    ),
+) -> None:
+    """Prove disposable Notion and Apple Reminders write/read capability."""
+
+    async def run_proof() -> bool:
+        from datetime import datetime, timezone
+        from uuid import uuid4
+
+        from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        try:
+            token = load_notion_token(notion_token)
+        except NotionAuthError as exc:
+            console.print(f"[red]Notion auth failed:[/red] {exc}")
+            return False
+
+        notion = NotionTasksAdapter(token=token, api_version=api_version)
+
+        try:
+            report = await notion.preflight_schema(data_source_id)
+            if not report.ok:
+                _print_notion_schema_report(report)
+                return False
+
+            notion_pages = await notion.query_tasks_by_title(
+                data_source_id, DISPOSABLE_NOTION_TO_APPLE_TITLE
+            )
+            if len(notion_pages) > 1:
+                console.print(
+                    "[red]Refusing to continue:[/red] multiple disposable Notion rows "
+                    f"named {DISPOSABLE_NOTION_TO_APPLE_TITLE!r} were found."
+                )
+                return False
+
+            if notion_pages:
+                notion_page = notion_pages[0]
+                sync_id = page_apple_sync_id(notion_page)
+                if not sync_id:
+                    console.print(
+                        "[red]Refusing to update disposable Notion row without "
+                        "Apple Sync ID.[/red]"
+                    )
+                    return False
+                notion_action = "found"
+            else:
+                sync_id = f"apple-reminders-proof:{uuid4()}"
+                notion_page = await notion.create_disposable_task(
+                    data_source_id=data_source_id,
+                    apple_sync_id=sync_id,
+                    notes=f"Disposable sync proof row created at {timestamp}.",
+                )
+                notion_action = "created"
+
+            notion_page_id = notion_page["id"]
+            notion_note = f"Disposable sync proof updated at {timestamp}. Sync ID: {sync_id}"
+            await notion.update_page_notes(notion_page_id, notion_note)
+            notion_page = await notion.retrieve_page(notion_page_id)
+
+            if page_title(notion_page) != DISPOSABLE_NOTION_TO_APPLE_TITLE:
+                console.print("[red]Notion re-read verification failed: title changed.[/red]")
+                return False
+            if page_apple_sync_id(notion_page) != sync_id:
+                console.print("[red]Notion re-read verification failed: sync ID mismatch.[/red]")
+                return False
+            if page_notes(notion_page) != notion_note:
+                console.print("[red]Notion re-read verification failed: notes mismatch.[/red]")
+                return False
+
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            console.print(
+                f"[red]Notion proof failed:[/red] "
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+            return False
+        except httpx.HTTPError as exc:
+            console.print(f"[red]Notion proof failed:[/red] {exc}")
+            return False
+
+        try:
+            reminders = RemindersAdapter()
+            if not await reminders.request_access():
+                console.print("[red]Apple Reminders access was not granted.[/red]")
+                return False
+
+            calendars = await reminders.list_calendars()
+            target_calendar = next((cal for cal in calendars if cal.title == apple_calendar), None)
+            if not target_calendar:
+                console.print(
+                    f"[red]Apple Reminders list not found:[/red] {apple_calendar!r}"
+                )
+                return False
+
+            apple_items = [
+                reminder
+                for reminder in await reminders.get_reminders(calendar_id=target_calendar.uuid)
+                if reminder.title == DISPOSABLE_APPLE_TO_NOTION_TITLE
+            ]
+            if len(apple_items) > 1:
+                console.print(
+                    "[red]Refusing to continue:[/red] multiple disposable Apple reminders "
+                    f"named {DISPOSABLE_APPLE_TO_NOTION_TITLE!r} were found in "
+                    f"{apple_calendar!r}."
+                )
+                return False
+
+            if apple_items:
+                apple_item = apple_items[0]
+                apple_action = "found"
+            else:
+                apple_item = await reminders.create_reminder(
+                    calendar_id=target_calendar.uuid,
+                    title=DISPOSABLE_APPLE_TO_NOTION_TITLE,
+                    notes=f"Disposable sync proof reminder created at {timestamp}.",
+                    completed=False,
+                )
+                apple_action = "created"
+
+            apple_note = (
+                f"Disposable sync proof updated at {timestamp}. "
+                f"Notion page: {notion_page_id}"
+            )
+            await reminders.update_reminder(apple_item.uuid, notes=apple_note)
+            apple_items = [
+                reminder
+                for reminder in await reminders.get_reminders(calendar_id=target_calendar.uuid)
+                if reminder.title == DISPOSABLE_APPLE_TO_NOTION_TITLE
+            ]
+
+            if len(apple_items) != 1:
+                console.print("[red]Apple re-read verification failed: item count mismatch.[/red]")
+                return False
+            apple_item = apple_items[0]
+            if apple_item.notes != apple_note:
+                console.print("[red]Apple re-read verification failed: notes mismatch.[/red]")
+                return False
+
+        except Exception as exc:
+            console.print(f"[red]Apple proof failed:[/red] {exc}")
+            return False
+
+        table = Table(title="Disposable Notion ↔ Apple Proof")
+        table.add_column("Surface", style="cyan")
+        table.add_column("Action", style="green")
+        table.add_column("Verified Item")
+        table.add_row("Notion Tasks", notion_action, DISPOSABLE_NOTION_TO_APPLE_TITLE)
+        table.add_row("Apple Reminders", apple_action, DISPOSABLE_APPLE_TO_NOTION_TITLE)
+        console.print(table)
+        console.print(
+            "\n[green]Disposable write proof passed.[/green]\n"
+            "[dim]Only the exact [SYNC TEST] Notion row and exact [SYNC TEST] "
+            "Apple reminder were created or updated.[/dim]"
+        )
+        return True
+
+    passed = asyncio.run(run_proof())
     if not passed:
         raise typer.Exit(1)
 

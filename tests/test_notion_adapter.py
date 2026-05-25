@@ -3,7 +3,11 @@ import pytest
 from icloudbridge.sources.reminders.notion_adapter import (
     DEFAULT_NOTION_API_VERSION,
     DEFAULT_TASKS_DATA_SOURCE_ID,
+    DISPOSABLE_APPLE_TO_NOTION_TITLE,
+    DISPOSABLE_NOTION_TO_APPLE_TITLE,
     NotionTasksAdapter,
+    build_disposable_task_properties,
+    build_exact_title_query,
     _find_token_in_json,
 )
 
@@ -138,3 +142,26 @@ def test_find_token_in_nested_ntn_auth_json():
     )
 
     assert token == "secret_test_token"
+
+
+def test_build_disposable_task_properties_uses_safe_existing_options():
+    properties = build_disposable_task_properties("sync-test-uuid", "Proof note")
+
+    assert properties["Task Name"]["title"][0]["text"]["content"] == DISPOSABLE_NOTION_TO_APPLE_TITLE
+    assert properties["Apple Sync ID"]["rich_text"][0]["text"]["content"] == "sync-test-uuid"
+    assert properties["Source"]["select"]["name"] == "Manual"
+    assert properties["Area"]["select"]["name"] == "Life"
+    assert properties["Status"]["status"]["name"] == "Not started"
+    assert properties["Notes"]["rich_text"][0]["text"]["content"] == "Proof note"
+
+
+def test_build_exact_title_query_filters_only_the_disposable_title():
+    query = build_exact_title_query(DISPOSABLE_APPLE_TO_NOTION_TITLE)
+
+    assert query == {
+        "filter": {
+            "property": "Task Name",
+            "title": {"equals": DISPOSABLE_APPLE_TO_NOTION_TITLE},
+        },
+        "page_size": 10,
+    }
