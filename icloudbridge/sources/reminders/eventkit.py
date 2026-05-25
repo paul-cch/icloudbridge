@@ -233,17 +233,17 @@ class RemindersAdapter:
         try:
             logger.info(f"Creating Apple Reminders calendar: {calendar_name}")
 
-            # Get the default source for reminders (usually iCloud)
-            sources = self.store.sources()
-            default_source = None
-            for source in sources:
-                if source.sourceType() == 1:  # EKSourceTypeCalDAV (iCloud)
-                    default_source = source
-                    break
+            # Use the same source as the default Reminders list. EventKit source
+            # numeric values differ from this project's older assumption, and
+            # saving to a generic event source can report success without the
+            # list appearing in Reminders.
+            default_calendar = self.store.defaultCalendarForNewReminders()
+            default_source = default_calendar.source() if default_calendar else None
 
-            # Fallback to local source if no CalDAV source found
-            if not default_source and sources:
-                default_source = sources[0]
+            if not default_source:
+                reminder_sources = self.store.reminderSources()
+                if reminder_sources:
+                    default_source = reminder_sources[0]
 
             if not default_source:
                 logger.error("No source available for creating calendar")
@@ -261,10 +261,25 @@ class RemindersAdapter:
             success = self.store.saveCalendar_commit_error_(new_calendar, True, None)
 
             if success:
+                calendars = self.store.calendarsForEntityType_(EKEntityTypeReminder)
+                persisted = next(
+                    (cal for cal in calendars if cal.calendarIdentifier() == new_calendar.calendarIdentifier()),
+                    None,
+                )
+                if persisted is None:
+                    persisted = next((cal for cal in calendars if cal.title() == calendar_name), None)
+
+                if persisted is None:
+                    logger.error(
+                        "EventKit reported success creating calendar '%s', but it was not visible after save",
+                        calendar_name,
+                    )
+                    return None
+
                 logger.info(f"Successfully created calendar: {calendar_name}")
                 return ReminderCalendar(
-                    uuid=new_calendar.calendarIdentifier(),
-                    title=new_calendar.title(),
+                    uuid=persisted.calendarIdentifier(),
+                    title=persisted.title(),
                 )
             else:
                 logger.error(f"Failed to create calendar: {calendar_name}")
