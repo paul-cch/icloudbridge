@@ -2,9 +2,9 @@
 
 ## Confidence Statement
 
-This plan is not treated as 100% proven until the verification gates near the end pass against live Apple Reminders and a safe Notion test slice.
+Milestones 0 through 5D are implemented and proven against the live `Notion Sync Test` slice.
 
-The strategy is currently high-confidence as an implementation direction, but not factually complete enough for production writes. The reason is simple: Apple EventKit identifiers, Notion schema behavior, and bidirectional deletion semantics all have edge cases that cannot be resolved by design alone. They need executable tests.
+The strategy is now high-confidence for the disposable test slice, including creates and bidirectional updates for title, notes, completion, priority, timed due dates, all-day due dates, and due-date clearing. It is not yet production-ready for normal lists because identity recovery, Notion 429 retry behavior, and deletion/cancellation grace policy remain open.
 
 ## Goal
 
@@ -364,6 +364,7 @@ Do not store Notion tokens in plaintext project files. Use the platform keychain
 
 ### Milestone 0: Schema And Capability Preflight
 
+- Status: implemented and live-proven.
 - Read the Notion data source schema.
 - Verify required properties.
 - Verify identity properties exist, or produce a migration plan.
@@ -374,6 +375,7 @@ Done when: preflight produces a pass/fail report without writes to real tasks.
 
 ### Milestone 1: Read-Only Proof
 
+- Status: implemented and live-proven.
 - Add Notion adapter with schema-aware parsing.
 - Read tasks from Paul's `Tasks` data source through an explicit safe filter.
 - Read reminders from one Apple list.
@@ -383,6 +385,7 @@ Done when: a command can show matched/unmatched Apple and Notion tasks without w
 
 ### Milestone 2: Dedicated Test Slice
 
+- Status: implemented and live-proven.
 - Create or use a Notion test data source/test rows.
 - Create an Apple Reminders list called `Notion Sync Test`.
 - Run all write tests only against the test slice.
@@ -391,6 +394,7 @@ Done when: no production Notion rows or normal Apple lists are touched.
 
 ### Milestone 3: One-Way Notion To Apple
 
+- Status: implemented and live-proven.
 - Create Apple reminders for selected Notion test tasks.
 - Update the local SQLite ledger.
 - Preserve due dates, title, notes, completion state, and priority.
@@ -400,6 +404,7 @@ Done when: dry-run and real sync pass twice with zero unexpected changes.
 
 ### Milestone 4: One-Way Apple To Notion
 
+- Status: implemented and live-proven.
 - Create Notion rows for reminders in the chosen Apple test list.
 - Set safe defaults for `Source`, `Area`, `Status`, and `Apple Sync ID`.
 - Avoid touching existing `External ID` values.
@@ -409,13 +414,22 @@ Done when: a new Apple reminder appears in Notion and a second sync is unchanged
 
 ### Milestone 5: Bidirectional Updates
 
+- Status: implemented for safe test-slice updates; conflict handling remains detection-only.
 - Detect single-side updates.
 - Update the opposite side.
-- Suppress echo loops.
-- Implement last-write-wins for simple conflicts.
+- Suppress echo loops with snapshot baselines.
 - Record sync stats and errors.
 
 Done when: title, notes, due date, priority, and completion changes propagate both ways across two repeated sync cycles.
+
+### Milestone 5D: Live Bidirectional Field Matrix Proof
+
+- Status: implemented and live-proven.
+- Command: `icloudbridge reminders notion-update-proof --apple-calendar "Notion Sync Test" --field FIELD --direction DIRECTION --apply`.
+- Fields proven both directions: `title`, `notes`, `completion`, `priority`, `timed-due`, `all-day-due`, `clear-due`.
+- Safety gates: refuses non-test lists, requires `--apply`, mutates only `[SYNC TEST]` matched rows, never creates/deletes/cancels/recovers identities.
+
+Done when: every supported update field converges to `NOOP: 2`, and the same executor run immediately afterward updates `0` rows.
 
 ### Milestone 6: Identity Recovery
 
@@ -488,21 +502,33 @@ Manual test protocol:
 
 The strategy graduates from design to production only when all gates pass:
 
-- Gate A: schema preflight passes against the live Notion Tasks data source.
-- Gate B: read-only proof lists the expected Notion rows and Apple reminders.
-- Gate C: test-slice Notion -> Apple sync creates no duplicates across two runs.
-- Gate D: test-slice Apple -> Notion sync creates no duplicates across two runs.
-- Gate E: bidirectional edits converge to unchanged after a second sync.
-- Gate F: completion status converges both ways.
-- Gate G: all-day and timed due dates preserve the displayed date/time.
-- Gate H: lost Apple identifier simulation does not duplicate or cancel a task.
-- Gate I: Notion 429 retry handling is tested.
-- Gate J: deletion/cancellation grace policy is tested with no hard deletes.
+- Gate A: closed. Schema preflight passes against the live Notion Tasks data source.
+- Gate B: closed. Read-only proof lists the expected Notion rows and Apple reminders.
+- Gate C: closed. Test-slice Notion -> Apple sync creates no duplicates across repeated runs.
+- Gate D: closed. Test-slice Apple -> Notion sync creates no duplicates across repeated runs.
+- Gate E: closed for the test slice. Bidirectional edits converge to unchanged after a second sync.
+- Gate F: closed for the test slice. Completion status converges both ways.
+- Gate G: mostly closed for the test slice. Timed, all-day, and cleared due dates converge both ways; broader DST boundary coverage remains future hardening.
+- Gate H: open. Lost Apple identifier simulation is not implemented yet.
+- Gate I: open. Notion 429 retry handling is not tested yet.
+- Gate J: open. Deletion/cancellation grace policy is not tested yet.
 
 Until those pass, the app must default to dry-run or test-slice mode.
 
-## First Concrete Next Step
+## Implementation Receipts
 
-Implement Milestone 0, not Milestone 1:
+- `310917c`: Add disposable Notion reminders proof.
+- `a9abb77`: Add Notion reminders read-only proof.
+- `fcb0fb7`: Add Notion reminders dry-run planner.
+- `5bf5343`: Add Notion to Apple test-slice sync.
+- `914f774`: Add Apple to Notion test-slice sync.
+- `7508382`: Add Notion reminders bidirectional update sync.
+- `634213f`: Add Notion reminders field proof command.
 
-Create a schema/capability preflight command that checks the live Notion Tasks schema, verifies Apple Reminders access, and reports whether the required identity properties exist. Do not implement writes until preflight and a dedicated test slice are in place.
+Milestone 5D live proof matrix was run against `Notion Sync Test` for all seven supported fields in both directions. The final live update plan reported `NOOP: 2` with all other action counts at `0`.
+
+## Next Concrete Step
+
+Implement Milestone 6, not production-list sync:
+
+Add identity recovery for lost Apple local identifiers, then prove it does not duplicate, cancel, or rewrite the disposable Notion rows. Keep Notion 429 retry handling and deletion/cancellation grace policy explicitly open until they get their own proof gates.
