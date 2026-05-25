@@ -210,6 +210,37 @@ def build_disposable_task_properties(
     }
 
 
+def build_apple_origin_task_properties(
+    title: str,
+    notes: str | None,
+    apple_sync_id: str,
+    apple_reminder_id: str,
+    completed: bool,
+    due_date: datetime | None,
+    due_is_all_day: bool,
+) -> dict[str, Any]:
+    """Build Notion properties for an Apple-originated reminder test row."""
+    properties = {
+        "Task Name": {"title": [{"text": {"content": title}}]},
+        "Apple Sync ID": _rich_text(apple_sync_id),
+        "Apple Reminder ID": _rich_text(apple_reminder_id),
+        "Source": {"select": {"name": "Manual"}},
+        "Area": {"select": {"name": "Life"}},
+        "Status": {"status": {"name": "Done" if completed else "Not started"}},
+    }
+    if notes:
+        properties["Notes"] = _rich_text(notes)
+    if due_date:
+        properties["Due Date"] = {
+            "date": {
+                "start": due_date.date().isoformat()
+                if due_is_all_day
+                else due_date.isoformat()
+            }
+        }
+    return properties
+
+
 def build_notes_patch(notes: str) -> dict[str, Any]:
     """Build a Notion page property patch for the Notes field."""
     return {"Notes": _rich_text(notes)}
@@ -394,6 +425,41 @@ class NotionTasksAdapter:
                         apple_sync_id=apple_sync_id,
                         notes=notes,
                         title=title,
+                    ),
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def create_apple_origin_task(
+        self,
+        data_source_id: str,
+        title: str,
+        notes: str | None,
+        apple_sync_id: str,
+        apple_reminder_id: str,
+        completed: bool,
+        due_date: datetime | None,
+        due_is_all_day: bool,
+    ) -> dict[str, Any]:
+        """Create a Notion Tasks row from an Apple reminder."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/v1/pages",
+                headers=self._headers(),
+                json={
+                    "parent": {
+                        "type": "data_source_id",
+                        "data_source_id": data_source_id,
+                    },
+                    "properties": build_apple_origin_task_properties(
+                        title=title,
+                        notes=notes,
+                        apple_sync_id=apple_sync_id,
+                        apple_reminder_id=apple_reminder_id,
+                        completed=completed,
+                        due_date=due_date,
+                        due_is_all_day=due_is_all_day,
                     ),
                 },
             )

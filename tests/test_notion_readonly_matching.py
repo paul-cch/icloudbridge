@@ -6,6 +6,7 @@ import pytest
 from icloudbridge.core.notion_reminders_readonly import (
     ReadOnlyMatchReport,
     execute_create_apple_plan,
+    execute_create_notion_plan,
     build_readonly_match_report,
     build_readonly_sync_plan,
     map_notion_priority_to_apple,
@@ -32,8 +33,15 @@ def _notion_task(title, sync_id=None, reminder_id=None, status="Not started", pr
     )
 
 
-def _apple_reminder(title, uuid):
-    return SimpleNamespace(uuid=uuid, title=title, completed=False, due_date=None)
+def _apple_reminder(title, uuid, completed=False, notes=None, due_date=None, is_all_day=False):
+    return SimpleNamespace(
+        uuid=uuid,
+        title=title,
+        notes=notes,
+        completed=completed,
+        due_date=due_date,
+        is_all_day=is_all_day,
+    )
 
 
 def test_build_readonly_match_report_matches_by_apple_reminder_id_first():
@@ -166,9 +174,26 @@ class FakeRemindersAdapter:
 class FakeNotionAdapter:
     def __init__(self):
         self.updated_receipts = []
+        self.create_calls = []
 
     async def update_page_apple_reminder_id(self, page_id, apple_reminder_id):
         self.updated_receipts.append((page_id, apple_reminder_id))
+
+    async def create_apple_origin_task(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return {
+            "id": "notion-created",
+            "properties": {
+                "Apple Sync ID": {
+                    "type": "rich_text",
+                    "rich_text": [{"plain_text": kwargs["apple_sync_id"]}],
+                },
+                "Apple Reminder ID": {
+                    "type": "rich_text",
+                    "rich_text": [{"plain_text": kwargs["apple_reminder_id"]}],
+                },
+            },
+        }
 
 
 class FakeNotionRemindersDB:
@@ -277,6 +302,105 @@ async def test_execute_create_apple_plan_refuses_multiple_creates_by_default():
             apple_calendar_name="Notion Sync Test",
             apple_calendar_id="calendar-id",
             reminders_adapter=FakeRemindersAdapter(),
+            notion_adapter=FakeNotionAdapter(),
+            db=FakeNotionRemindersDB(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_create_notion_plan_creates_one_row_and_persists_identity():
+    db = FakeNotionRemindersDB()
+    notion = FakeNotionAdapter()
+    report = build_readonly_match_report(
+        notion_tasks=[],
+        apple_reminders=[_apple_reminder("Only Apple", "apple-1", notes="From Apple")],
+    )
+    plan = build_readonly_sync_plan(report)
+
+    result = await execute_create_notion_plan(
+        plan,
+        data_source_id="data-source-id",
+        apple_calendar_name="Notion Sync Test",
+        notion_adapter=notion,
+        db=db,
+        sync_id_factory=lambda: "apple-reminders:fixed",
+    )
+
+    assert result.created_notion == 1
+    assert notion.create_calls == [
+        {
+            "data_source_id": "data-source-id",
+            "title": "Only Apple",
+            "notes": "From Apple",
+            "apple_sync_id": "apple-reminders:fixed",
+            "apple_reminder_id": "apple-1",
+            "completed": False,
+            "due_date": None,
+            "due_is_all_day": False,
+        }
+    ]
+    assert len(db.mappings) == 1
+    mapping = db.mappings[0]
+    assert mapping["apple_sync_id"] == "apple-reminders:fixed"
+    assert mapping["notion_page_id"] == "notion-created"
+    assert mapping["apple_reminder_id"] == "apple-1"
+    assert mapping["apple_calendar_name"] == "Notion Sync Test"
+
+
+@pytest.mark.asyncio
+async def test_execute_create_notion_plan_skips_noop_and_create_apple_actions():
+    db = FakeNotionRemindersDB()
+    notion = FakeNotionAdapter()
+    report = build_readonly_match_report(
+        notion_tasks=[
+            _notion_task("Same title", sync_id="sync-1"),
+            _notion_task("Only Notion", sync_id="sync-2"),
+        ],
+        apple_reminders=[_apple_reminder("Same title", "apple-1")],
+    )
+    plan = build_readonly_sync_plan(report)
+
+    result = await execute_create_notion_plan(
+        plan,
+        data_source_id="data-source-id",
+        apple_calendar_name="Notion Sync Test",
+        notion_adapter=notion,
+        db=db,
+        sync_id_factory=lambda: "apple-reminders:fixed",
+    )
+
+    assert result.created_notion == 0
+    assert notion.create_calls == []
+    assert db.mappings == []
+
+
+@pytest.mark.asyncio
+async def test_execute_create_notion_plan_refuses_non_test_list():
+    with pytest.raises(ValueError, match="Notion Sync Test"):
+        await execute_create_notion_plan(
+            build_readonly_sync_plan(ReadOnlyMatchReport()),
+            data_source_id="data-source-id",
+            apple_calendar_name="Life",
+            notion_adapter=FakeNotionAdapter(),
+            db=FakeNotionRemindersDB(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_create_notion_plan_refuses_multiple_creates_by_default():
+    report = build_readonly_match_report(
+        notion_tasks=[],
+        apple_reminders=[
+            _apple_reminder("One", "apple-1"),
+            _apple_reminder("Two", "apple-2"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="multiple CREATE_NOTION"):
+        await execute_create_notion_plan(
+            build_readonly_sync_plan(report),
+            data_source_id="data-source-id",
+            apple_calendar_name="Notion Sync Test",
             notion_adapter=FakeNotionAdapter(),
             db=FakeNotionRemindersDB(),
         )

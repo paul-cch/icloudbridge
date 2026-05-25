@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
-from icloudbridge.sources.reminders.notion_adapter import NotionTask
+from icloudbridge.sources.reminders.notion_adapter import NotionTask, page_apple_sync_id
 
 
 @dataclass
@@ -70,8 +71,20 @@ class CreateAppleExecutionResult:
     skipped_non_create_apple: int = 0
 
 
+@dataclass
+class CreateNotionExecutionResult:
+    """Stats from applying CREATE_NOTION actions."""
+
+    created_notion: int = 0
+    skipped_non_create_notion: int = 0
+
+
 class CreateApplePartialFailure(RuntimeError):
     """Raised after Apple creation succeeds but identity persistence fails."""
+
+
+class CreateNotionPartialFailure(RuntimeError):
+    """Raised after Notion creation succeeds but SQLite identity persistence fails."""
 
 
 def map_notion_priority_to_apple(priority: str | None) -> int:
@@ -233,5 +246,64 @@ async def execute_create_apple_plan(
             ) from exc
 
         result.created_apple += 1
+
+    return result
+
+
+async def execute_create_notion_plan(
+    plan: ReadOnlySyncPlan,
+    data_source_id: str,
+    apple_calendar_name: str,
+    notion_adapter: Any,
+    db: Any,
+    allow_multiple_test_creates: bool = False,
+    sync_id_factory: Any | None = None,
+) -> CreateNotionExecutionResult:
+    """Execute only CREATE_NOTION actions for the dedicated Notion test slice."""
+    if apple_calendar_name != "Notion Sync Test":
+        raise ValueError("Milestone 4 can only create Notion rows from 'Notion Sync Test'")
+
+    create_actions = [action for action in plan.actions if action.kind == "CREATE_NOTION"]
+    if len(create_actions) > 1 and not allow_multiple_test_creates:
+        raise ValueError("Refusing multiple CREATE_NOTION actions without explicit opt-in")
+
+    result = CreateNotionExecutionResult(
+        skipped_non_create_notion=len(plan.actions) - len(create_actions)
+    )
+
+    for action in create_actions:
+        reminder = action.apple_reminder
+        if reminder is None:
+            continue
+
+        apple_sync_id = (
+            sync_id_factory() if sync_id_factory else f"apple-reminders:{uuid4()}"
+        )
+        created = await notion_adapter.create_apple_origin_task(
+            data_source_id=data_source_id,
+            title=getattr(reminder, "title", ""),
+            notes=getattr(reminder, "notes", None),
+            apple_sync_id=apple_sync_id,
+            apple_reminder_id=getattr(reminder, "uuid", ""),
+            completed=getattr(reminder, "completed", False),
+            due_date=getattr(reminder, "due_date", None),
+            due_is_all_day=getattr(reminder, "is_all_day", False),
+        )
+
+        try:
+            await db.upsert_notion_reminder_mapping(
+                apple_sync_id=page_apple_sync_id(created) or apple_sync_id,
+                notion_page_id=created["id"],
+                apple_reminder_id=getattr(reminder, "uuid", ""),
+                apple_calendar_name=apple_calendar_name,
+                timestamp=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            raise CreateNotionPartialFailure(
+                "Notion row was created, but SQLite identity persistence failed. "
+                "Rerun notion-plan before applying again."
+            ) from exc
+
+        result.created_notion += 1
 
     return result

@@ -6,6 +6,7 @@ from icloudbridge.sources.reminders.notion_adapter import (
     DISPOSABLE_APPLE_TO_NOTION_TITLE,
     DISPOSABLE_NOTION_TO_APPLE_TITLE,
     NotionTasksAdapter,
+    build_apple_origin_task_properties,
     build_apple_reminder_id_patch,
     build_disposable_task_properties,
     build_apple_sync_id_query,
@@ -236,3 +237,59 @@ def test_build_apple_reminder_id_patch_updates_only_identity_receipt():
             "rich_text": [{"text": {"content": "apple-id"}}],
         }
     }
+
+
+def test_build_apple_origin_task_properties_uses_safe_defaults_for_incomplete_reminder():
+    properties = build_apple_origin_task_properties(
+        title="[SYNC TEST] Apple to Notion",
+        notes="From Apple",
+        apple_sync_id="apple-reminders:uuid",
+        apple_reminder_id="apple-id",
+        completed=False,
+        due_date=None,
+        due_is_all_day=False,
+    )
+
+    assert properties["Task Name"]["title"][0]["text"]["content"] == "[SYNC TEST] Apple to Notion"
+    assert properties["Notes"]["rich_text"][0]["text"]["content"] == "From Apple"
+    assert properties["Apple Sync ID"]["rich_text"][0]["text"]["content"] == "apple-reminders:uuid"
+    assert properties["Apple Reminder ID"]["rich_text"][0]["text"]["content"] == "apple-id"
+    assert properties["Status"]["status"]["name"] == "Not started"
+    assert properties["Source"]["select"]["name"] == "Manual"
+    assert properties["Area"]["select"]["name"] == "Life"
+    assert "Due Date" not in properties
+
+
+def test_build_apple_origin_task_properties_maps_completed_and_due_date():
+    from datetime import datetime, timezone
+
+    due = datetime(2026, 5, 26, 9, 30, tzinfo=timezone.utc)
+
+    properties = build_apple_origin_task_properties(
+        title="Done Apple task",
+        notes=None,
+        apple_sync_id="apple-reminders:uuid",
+        apple_reminder_id="apple-id",
+        completed=True,
+        due_date=due,
+        due_is_all_day=False,
+    )
+
+    assert properties["Status"]["status"]["name"] == "Done"
+    assert properties["Due Date"]["date"]["start"] == "2026-05-26T09:30:00+00:00"
+
+
+def test_build_apple_origin_task_properties_preserves_date_only_due_date():
+    from datetime import datetime
+
+    properties = build_apple_origin_task_properties(
+        title="All-day Apple task",
+        notes=None,
+        apple_sync_id="apple-reminders:uuid",
+        apple_reminder_id="apple-id",
+        completed=False,
+        due_date=datetime(2026, 5, 26),
+        due_is_all_day=True,
+    )
+
+    assert properties["Due Date"]["date"]["start"] == "2026-05-26"
