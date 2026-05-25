@@ -109,6 +109,42 @@ class BidirectionalUpdatePlan:
 
 
 @dataclass
+class IdentityRecoveryAction:
+    """A proposed Apple reminder identity repair for a Notion row."""
+
+    kind: str
+    title: str
+    apple_sync_id: str
+    notion_page_id: str
+    old_apple_reminder_id: str | None
+    new_apple_reminder_id: str | None = None
+    reason: str = ""
+    notion_task: NotionTask | None = None
+    apple_reminder: Any | None = None
+    mapping: dict[str, Any] | None = None
+
+
+@dataclass
+class IdentityRecoveryPlan:
+    """Dry-run plan for repairing stale Apple reminder identity receipts."""
+
+    actions: list[IdentityRecoveryAction] = field(default_factory=list)
+
+    @property
+    def counts(self) -> dict[str, int]:
+        """Count planned identity recovery actions by kind."""
+        return {
+            "NOOP": sum(1 for action in self.actions if action.kind == "NOOP"),
+            "RECOVER_APPLE_ID": sum(
+                1 for action in self.actions if action.kind == "RECOVER_APPLE_ID"
+            ),
+            "UNRECOVERED": sum(
+                1 for action in self.actions if action.kind == "UNRECOVERED"
+            ),
+        }
+
+
+@dataclass
 class CreateAppleExecutionResult:
     """Stats from applying CREATE_APPLE actions."""
 
@@ -139,6 +175,14 @@ class UpdateNotionExecutionResult:
 
     updated_notion: int = 0
     skipped_non_update_notion: int = 0
+
+
+@dataclass
+class IdentityRecoveryExecutionResult:
+    """Stats from applying stale Apple reminder ID repairs."""
+
+    recovered: int = 0
+    skipped_non_recovery: int = 0
 
 
 @dataclass
@@ -447,6 +491,99 @@ def build_bidirectional_update_plan(
     return BidirectionalUpdatePlan(actions=actions)
 
 
+def _same_recovery_title(task: NotionTask, reminder: Any) -> bool:
+    return task.title == getattr(reminder, "title", None)
+
+
+def build_identity_recovery_plan(
+    notion_tasks: list[NotionTask],
+    apple_reminders: list[Any],
+    mappings: list[dict[str, Any]],
+) -> IdentityRecoveryPlan:
+    """Find stale Apple Reminder ID receipts without proposing content changes."""
+    by_sync_id = {mapping.get("apple_sync_id"): mapping for mapping in mappings}
+    apple_by_id = {
+        getattr(reminder, "uuid", None): reminder for reminder in apple_reminders
+    }
+    actions: list[IdentityRecoveryAction] = []
+
+    for task in notion_tasks:
+        apple_sync_id = task.apple_sync_id or task.page_id
+        mapping = by_sync_id.get(apple_sync_id)
+        old_id = task.apple_reminder_id or (mapping or {}).get("apple_reminder_id")
+        if not old_id:
+            actions.append(
+                IdentityRecoveryAction(
+                    kind="UNRECOVERED",
+                    title=task.title,
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=task.page_id,
+                    old_apple_reminder_id=None,
+                    reason="missing_identity_receipt",
+                    notion_task=task,
+                    mapping=mapping,
+                )
+            )
+            continue
+
+        current = apple_by_id.get(old_id)
+        if current is not None:
+            actions.append(
+                IdentityRecoveryAction(
+                    kind="NOOP",
+                    title=task.title,
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=task.page_id,
+                    old_apple_reminder_id=old_id,
+                    new_apple_reminder_id=old_id,
+                    reason="apple_id_current",
+                    notion_task=task,
+                    apple_reminder=current,
+                    mapping=mapping,
+                )
+            )
+            continue
+
+        candidates = [
+            reminder
+            for reminder in apple_reminders
+            if _same_recovery_title(task, reminder)
+        ]
+        if len(candidates) == 1:
+            recovered = candidates[0]
+            actions.append(
+                IdentityRecoveryAction(
+                    kind="RECOVER_APPLE_ID",
+                    title=task.title,
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=task.page_id,
+                    old_apple_reminder_id=old_id,
+                    new_apple_reminder_id=getattr(recovered, "uuid", None),
+                    reason="exact_title_single_candidate",
+                    notion_task=task,
+                    apple_reminder=recovered,
+                    mapping=mapping,
+                )
+            )
+        else:
+            actions.append(
+                IdentityRecoveryAction(
+                    kind="UNRECOVERED",
+                    title=task.title,
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=task.page_id,
+                    old_apple_reminder_id=old_id,
+                    reason="ambiguous_title_candidates" if candidates else "no_candidate",
+                    notion_task=task,
+                    mapping=mapping,
+                )
+            )
+
+    order = {"NOOP": 0, "RECOVER_APPLE_ID": 1, "UNRECOVERED": 2}
+    actions.sort(key=lambda action: (order[action.kind], action.title, action.apple_sync_id))
+    return IdentityRecoveryPlan(actions=actions)
+
+
 def build_readonly_match_report(
     notion_tasks: list[NotionTask],
     apple_reminders: list[Any],
@@ -752,4 +889,53 @@ async def execute_update_notion_plan(
         )
         result.updated_notion += 1
 
+    return result
+
+
+async def execute_identity_recovery_plan(
+    plan: IdentityRecoveryPlan,
+    apple_calendar_name: str,
+    notion_adapter: Any,
+    db: Any,
+    allow_multiple_test_recoveries: bool = False,
+) -> IdentityRecoveryExecutionResult:
+    """Apply only Apple reminder ID receipt recovery for the test slice."""
+    if apple_calendar_name != "Notion Sync Test":
+        raise ValueError("Milestone 6 can only recover identities in 'Notion Sync Test'")
+
+    recovery_actions = [
+        action for action in plan.actions if action.kind == "RECOVER_APPLE_ID"
+    ]
+    if len(recovery_actions) > 1 and not allow_multiple_test_recoveries:
+        raise ValueError("Refusing multiple identity recoveries without explicit opt-in")
+
+    result = IdentityRecoveryExecutionResult(
+        skipped_non_recovery=len(plan.actions) - len(recovery_actions)
+    )
+    for action in recovery_actions:
+        if not action.title.startswith("[SYNC TEST]"):
+            raise ValueError("Identity recovery may only mutate [SYNC TEST] rows")
+        if action.notion_task is None or action.apple_reminder is None:
+            continue
+        if not action.new_apple_reminder_id:
+            continue
+
+        timestamp = datetime.now(timezone.utc)
+        await notion_adapter.update_page_apple_reminder_id(
+            action.notion_page_id,
+            action.new_apple_reminder_id,
+        )
+        await db.replace_notion_mapping_apple_reminder_id(
+            apple_sync_id=action.apple_sync_id,
+            apple_reminder_id=action.new_apple_reminder_id,
+            apple_calendar_name=apple_calendar_name,
+            timestamp=timestamp,
+        )
+        await db.update_notion_reminder_snapshots(
+            apple_sync_id=action.apple_sync_id,
+            notion_snapshot=build_notion_snapshot(action.notion_task),
+            apple_snapshot=build_apple_snapshot(action.apple_reminder),
+            timestamp=timestamp,
+        )
+        result.recovered += 1
     return result

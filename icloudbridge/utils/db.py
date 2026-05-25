@@ -690,6 +690,32 @@ class NotionRemindersDB:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
+    async def replace_notion_mapping_apple_reminder_id(
+        self,
+        apple_sync_id: str,
+        apple_reminder_id: str,
+        apple_calendar_name: str,
+        timestamp: datetime,
+    ) -> None:
+        """Replace a stale Apple reminder ID for an existing Notion sync mapping."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE notion_reminder_mapping
+                SET apple_reminder_id = ?,
+                    apple_calendar_name = ?,
+                    updated_at = ?
+                WHERE apple_sync_id = ?
+                """,
+                (
+                    apple_reminder_id,
+                    apple_calendar_name,
+                    timestamp.isoformat(),
+                    apple_sync_id,
+                ),
+            )
+            await db.commit()
+
     async def update_notion_reminder_snapshots(
         self,
         apple_sync_id: str,

@@ -9,10 +9,12 @@ from icloudbridge.core.notion_reminders_readonly import (
     assert_proof_ready_plan,
     build_apple_snapshot,
     build_bidirectional_update_plan,
+    build_identity_recovery_plan,
     build_notion_snapshot,
     build_proof_mutation,
     execute_create_apple_plan,
     execute_create_notion_plan,
+    execute_identity_recovery_plan,
     execute_update_apple_plan,
     execute_update_notion_plan,
     build_readonly_match_report,
@@ -382,6 +384,50 @@ def test_build_bidirectional_update_plan_detects_conflict_and_stable_order():
     assert plan.counts["CONFLICT"] == 1
 
 
+def test_identity_recovery_plan_detects_stale_apple_reminder_id_by_title_and_snapshot():
+    base_task = _notion_task(
+        "[SYNC TEST] Notion to Apple",
+        sync_id="sync-1",
+        reminder_id="old-apple-id",
+    )
+    current_apple = _apple_reminder("[SYNC TEST] Notion to Apple", "new-apple-id")
+    mapping = _mapping_for(base_task, current_apple)
+    mapping["apple_reminder_id"] = "old-apple-id"
+
+    plan = build_identity_recovery_plan([base_task], [current_apple], [mapping])
+
+    assert plan.counts == {"NOOP": 0, "RECOVER_APPLE_ID": 1, "UNRECOVERED": 0}
+    action = plan.actions[0]
+    assert action.kind == "RECOVER_APPLE_ID"
+    assert action.old_apple_reminder_id == "old-apple-id"
+    assert action.new_apple_reminder_id == "new-apple-id"
+    assert action.reason == "exact_title_single_candidate"
+
+
+def test_identity_recovery_plan_refuses_ambiguous_title_candidates():
+    task = _notion_task("[SYNC TEST] Duplicate", sync_id="sync-1", reminder_id="old")
+    first = _apple_reminder("[SYNC TEST] Duplicate", "new-1")
+    second = _apple_reminder("[SYNC TEST] Duplicate", "new-2")
+    mapping = _mapping_for(task, first)
+    mapping["apple_reminder_id"] = "old"
+
+    plan = build_identity_recovery_plan([task], [first, second], [mapping])
+
+    assert plan.counts == {"NOOP": 0, "RECOVER_APPLE_ID": 0, "UNRECOVERED": 1}
+    assert plan.actions[0].kind == "UNRECOVERED"
+    assert plan.actions[0].reason == "ambiguous_title_candidates"
+
+
+def test_identity_recovery_plan_leaves_current_matches_as_noop():
+    task = _notion_task("[SYNC TEST] Same", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("[SYNC TEST] Same", "apple-1")
+    mapping = _mapping_for(task, apple)
+
+    plan = build_identity_recovery_plan([task], [apple], [mapping])
+
+    assert plan.counts == {"NOOP": 1, "RECOVER_APPLE_ID": 0, "UNRECOVERED": 0}
+
+
 class FakeRemindersAdapter:
     def __init__(self):
         self.create_calls = []
@@ -422,6 +468,7 @@ class FakeNotionAdapter:
 
     async def update_page_apple_reminder_id(self, page_id, apple_reminder_id):
         self.updated_receipts.append((page_id, apple_reminder_id))
+        return {"id": page_id, "properties": {}}
 
     async def create_apple_origin_task(self, **kwargs):
         self.create_calls.append(kwargs)
@@ -483,6 +530,96 @@ class FakeNotionRemindersDB:
 
     async def update_notion_reminder_snapshots(self, **kwargs):
         self.snapshots.append(kwargs)
+
+
+class FakeRecoveryDB:
+    def __init__(self):
+        self.replacements = []
+        self.snapshots = []
+
+    async def replace_notion_mapping_apple_reminder_id(
+        self,
+        apple_sync_id,
+        apple_reminder_id,
+        apple_calendar_name,
+        timestamp,
+    ):
+        self.replacements.append(
+            (apple_sync_id, apple_reminder_id, apple_calendar_name, timestamp)
+        )
+
+    async def update_notion_reminder_snapshots(
+        self,
+        apple_sync_id,
+        notion_snapshot,
+        apple_snapshot,
+        timestamp,
+    ):
+        self.snapshots.append((apple_sync_id, notion_snapshot, apple_snapshot, timestamp))
+
+
+class FakeRecoveryNotion:
+    def __init__(self):
+        self.updated_ids = []
+
+    async def update_page_apple_reminder_id(self, page_id, apple_reminder_id):
+        self.updated_ids.append((page_id, apple_reminder_id))
+        return {"id": page_id, "properties": {}}
+
+
+@pytest.mark.asyncio
+async def test_execute_identity_recovery_plan_repairs_one_receipt_and_snapshots():
+    task = _notion_task("[SYNC TEST] Notion to Apple", sync_id="sync-1", reminder_id="old")
+    apple = _apple_reminder("[SYNC TEST] Notion to Apple", "new")
+    mapping = _mapping_for(task, apple)
+    mapping["apple_reminder_id"] = "old"
+    plan = build_identity_recovery_plan([task], [apple], [mapping])
+    notion = FakeRecoveryNotion()
+    db = FakeRecoveryDB()
+
+    result = await execute_identity_recovery_plan(
+        plan,
+        apple_calendar_name="Notion Sync Test",
+        notion_adapter=notion,
+        db=db,
+    )
+
+    assert result.recovered == 1
+    assert result.skipped_non_recovery == 0
+    assert notion.updated_ids == [(task.page_id, "new")]
+    assert db.replacements[0][0:3] == ("sync-1", "new", "Notion Sync Test")
+    assert db.snapshots[0][0] == "sync-1"
+
+
+@pytest.mark.asyncio
+async def test_execute_identity_recovery_plan_refuses_non_test_list_and_multiple_by_default():
+    first = _notion_task("[SYNC TEST] One", sync_id="sync-1", reminder_id="old-1")
+    second = _notion_task("[SYNC TEST] Two", sync_id="sync-2", reminder_id="old-2")
+    first_apple = _apple_reminder("[SYNC TEST] One", "new-1")
+    second_apple = _apple_reminder("[SYNC TEST] Two", "new-2")
+    plan = build_identity_recovery_plan(
+        [first, second],
+        [first_apple, second_apple],
+        [
+            {**_mapping_for(first, first_apple), "apple_reminder_id": "old-1"},
+            {**_mapping_for(second, second_apple), "apple_reminder_id": "old-2"},
+        ],
+    )
+
+    with pytest.raises(ValueError, match="Notion Sync Test"):
+        await execute_identity_recovery_plan(
+            plan,
+            apple_calendar_name="Real List",
+            notion_adapter=FakeRecoveryNotion(),
+            db=FakeRecoveryDB(),
+        )
+    with pytest.raises(ValueError, match="multiple"):
+        await execute_identity_recovery_plan(
+            plan,
+            apple_calendar_name="Notion Sync Test",
+            notion_adapter=FakeRecoveryNotion(),
+            db=FakeRecoveryDB(),
+        )
 
 
 @pytest.mark.asyncio

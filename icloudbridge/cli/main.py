@@ -27,12 +27,14 @@ from icloudbridge.core.notion_reminders_readonly import (
     assert_proof_ready_plan,
     build_apple_snapshot,
     build_bidirectional_update_plan,
+    build_identity_recovery_plan,
     build_notion_snapshot,
     build_proof_mutation,
     build_readonly_match_report,
     build_readonly_sync_plan,
     execute_create_apple_plan,
     execute_create_notion_plan,
+    execute_identity_recovery_plan,
     execute_update_apple_plan,
     execute_update_notion_plan,
 )
@@ -2060,6 +2062,31 @@ def _print_update_plan(title: str, update_plan) -> None:
     console.print(actions_table)
 
 
+def _print_identity_recovery_plan(title: str, plan) -> None:
+    summary = Table(title=title)
+    summary.add_column("Action", style="cyan")
+    summary.add_column("Count", style="green", justify="right")
+    for kind in ("NOOP", "RECOVER_APPLE_ID", "UNRECOVERED"):
+        summary.add_row(kind, str(plan.counts[kind]))
+    console.print(summary)
+
+    table = Table(title="Identity Recovery Actions")
+    table.add_column("Action", style="cyan")
+    table.add_column("Title", style="white")
+    table.add_column("Old Apple ID", style="red")
+    table.add_column("New Apple ID", style="green")
+    table.add_column("Reason", style="yellow")
+    for action in plan.actions:
+        table.add_row(
+            action.kind,
+            action.title,
+            action.old_apple_reminder_id or "",
+            action.new_apple_reminder_id or "",
+            action.reason,
+        )
+    console.print(table)
+
+
 async def _read_notion_update_plan(
     data_source_id: str,
     apple_calendar: str,
@@ -2100,6 +2127,200 @@ async def _read_notion_update_plan(
     mappings = await db.get_all_notion_reminder_mappings()
     update_plan = build_bidirectional_update_plan(match_report, mappings)
     return update_plan, notion, reminders, db
+
+
+async def _read_notion_identity_recovery_plan(
+    data_source_id: str,
+    apple_calendar: str,
+    notion_token: str | None,
+    api_version: str,
+    notion_page_size: int,
+    db_path: Path,
+):
+    from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+    from icloudbridge.utils.db import NotionRemindersDB
+
+    token = load_notion_token(notion_token)
+    notion = NotionTasksAdapter(token=token, api_version=api_version)
+    report = await notion.preflight_schema(data_source_id)
+    if not report.ok:
+        _print_notion_schema_report(report)
+        return None, None, None, None
+
+    notion_tasks = await notion.query_tasks_with_apple_sync_id(
+        data_source_id=data_source_id,
+        page_size=notion_page_size,
+    )
+    reminders = RemindersAdapter()
+    if not await reminders.request_access():
+        console.print("[red]Apple Reminders access was not granted.[/red]")
+        return None, None, None, None
+
+    calendars = await reminders.list_calendars()
+    target_calendar = next((cal for cal in calendars if cal.title == apple_calendar), None)
+    if not target_calendar:
+        console.print(f"[red]Apple Reminders list not found:[/red] {apple_calendar!r}")
+        return None, None, None, None
+
+    apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+    db = NotionRemindersDB(db_path)
+    await db.initialize()
+    mappings = await db.get_all_notion_reminder_mappings()
+    recovery_plan = build_identity_recovery_plan(notion_tasks, apple_reminders, mappings)
+    return recovery_plan, notion, reminders, db
+
+
+@reminders_app.command("notion-recovery-plan")
+def reminders_notion_recovery_plan(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+) -> None:
+    """Plan test-slice Apple reminder identity recovery without writes."""
+
+    async def run_recovery_plan() -> bool:
+        try:
+            recovery_plan, _, _, _ = await _read_notion_identity_recovery_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+        except NotionAuthError as exc:
+            console.print(f"[red]Notion auth failed:[/red] {exc}")
+            return False
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            console.print(
+                f"[red]Notion recovery planning read failed:[/red] "
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+            return False
+        except Exception as exc:
+            console.print(f"[red]Recovery planning failed:[/red] {exc}")
+            return False
+
+        if recovery_plan is None:
+            return False
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                f"[yellow]Warning:[/yellow] planning against non-test list "
+                f"{apple_calendar!r}; this command is read-only."
+            )
+        _print_identity_recovery_plan("Milestone 6 Identity Recovery Plan", recovery_plan)
+        console.print("\n[green]No writes attempted.[/green]")
+        return True
+
+    passed = asyncio.run(run_recovery_plan())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-recover-identity")
+def reminders_notion_recover_identity(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    apply: bool = typer.Option(False, "--apply", help="Actually recover stale IDs"),
+    allow_multiple_test_recoveries: bool = typer.Option(
+        False,
+        "--allow-multiple-test-recoveries",
+        help="Allow more than one identity recovery in the test list",
+    ),
+) -> None:
+    """Apply test-slice Apple reminder identity recovery."""
+
+    async def run_recover_identity() -> bool:
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                "[red]Refusing to run:[/red] identity recovery is limited to "
+                "'Notion Sync Test'."
+            )
+            return False
+        try:
+            recovery_plan, notion, _, db = await _read_notion_identity_recovery_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if recovery_plan is None or notion is None or db is None:
+                return False
+            _print_identity_recovery_plan("Milestone 6 Identity Recovery Plan", recovery_plan)
+            if not apply:
+                console.print(
+                    "\n[yellow]Dry run only.[/yellow] Pass --apply to recover stale IDs."
+                )
+                return True
+
+            result = await execute_identity_recovery_plan(
+                recovery_plan,
+                apple_calendar_name=apple_calendar,
+                notion_adapter=notion,
+                db=db,
+                allow_multiple_test_recoveries=allow_multiple_test_recoveries,
+            )
+            result_table = Table(title="Milestone 6 Apply Result")
+            result_table.add_column("Metric", style="cyan")
+            result_table.add_column("Count", style="green", justify="right")
+            result_table.add_row("Recovered Apple IDs", str(result.recovered))
+            result_table.add_row(
+                "Skipped non-recovery actions",
+                str(result.skipped_non_recovery),
+            )
+            console.print(result_table)
+
+            post_plan, _, _, _ = await _read_notion_identity_recovery_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if post_plan is None:
+                return False
+            _print_identity_recovery_plan("Post-Recovery Plan", post_plan)
+
+            update_plan, _, _, _ = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if update_plan is None:
+                return False
+            _print_update_plan("Post-Recovery Update Plan", update_plan)
+            if update_plan.counts["CONFLICT"]:
+                raise ValueError("Recovery introduced conflicts; inspect before continuing")
+            return True
+        except Exception as exc:
+            console.print(f"[red]Identity recovery failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_recover_identity())
+    if not passed:
+        raise typer.Exit(1)
 
 
 @reminders_app.command("notion-update-plan")
@@ -2615,6 +2836,199 @@ def reminders_notion_update_proof(
             return False
 
     passed = asyncio.run(run_update_proof())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-recovery-proof")
+def reminders_notion_recovery_proof(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    apply: bool = typer.Option(False, "--apply", help="Actually run the live proof"),
+) -> None:
+    """Run the Milestone 6 stale Apple Reminder ID recovery proof."""
+
+    async def run_recovery_proof() -> bool:
+        if apple_calendar != "Notion Sync Test":
+            console.print("[red]Refusing proof:[/red] only 'Notion Sync Test' is allowed.")
+            return False
+        if not apply:
+            console.print("[red]Refusing proof:[/red] --apply is required for live mutations.")
+            return False
+
+        stale_id = "MILESTONE-6-STALE-ID"
+        stale_applied = False
+        recovery_completed = False
+        original_page_id = ""
+        original_title = ""
+        original_apple_id = ""
+        target = None
+        db = None
+        notion = None
+
+        try:
+            initial_update_plan, notion, _, db = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if initial_update_plan is None or notion is None or db is None:
+                return False
+            assert_proof_ready_plan(initial_update_plan)
+
+            recovery_plan, _, _, _ = await _read_notion_identity_recovery_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if recovery_plan is None:
+                return False
+            if recovery_plan.counts != {
+                "NOOP": 2,
+                "RECOVER_APPLE_ID": 0,
+                "UNRECOVERED": 0,
+            }:
+                raise ValueError(
+                    f"Proof requires exactly 2 current identities, got {recovery_plan.counts}"
+                )
+
+            candidates = [
+                action
+                for action in recovery_plan.actions
+                if action.kind == "NOOP"
+                and action.title.startswith("[SYNC TEST]")
+                and action.new_apple_reminder_id
+            ]
+            if len(candidates) != 2:
+                raise ValueError("Proof requires exactly two matched [SYNC TEST] rows")
+            target = candidates[0]
+            original_page_id = target.notion_page_id
+            original_title = target.title
+            original_apple_id = target.new_apple_reminder_id or ""
+
+            await notion.update_page_apple_reminder_id(original_page_id, stale_id)
+            stale_applied = True
+
+            stale_plan, _, _, db = await _read_notion_identity_recovery_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if stale_plan is None or db is None:
+                return False
+            if stale_plan.counts != {
+                "NOOP": 1,
+                "RECOVER_APPLE_ID": 1,
+                "UNRECOVERED": 0,
+            }:
+                raise ValueError(
+                    f"Proof expected one recovery candidate, got {stale_plan.counts}"
+                )
+
+            first = await execute_identity_recovery_plan(
+                stale_plan,
+                apple_calendar_name=apple_calendar,
+                notion_adapter=notion,
+                db=db,
+            )
+            first_count = first.recovered
+            recovery_completed = first_count == 1
+
+            final_recovery_plan, _, _, _ = await _read_notion_identity_recovery_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if final_recovery_plan is None:
+                return False
+            if final_recovery_plan.counts != {
+                "NOOP": 2,
+                "RECOVER_APPLE_ID": 0,
+                "UNRECOVERED": 0,
+            }:
+                raise ValueError(
+                    f"Proof expected recovered identities, got {final_recovery_plan.counts}"
+                )
+
+            final_update_plan, _, _, _ = await _read_notion_update_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if final_update_plan is None:
+                return False
+            assert_proof_ready_plan(final_update_plan)
+
+            second = await execute_identity_recovery_plan(
+                final_recovery_plan,
+                apple_calendar_name=apple_calendar,
+                notion_adapter=notion,
+                db=db,
+            )
+            second_count = second.recovered
+            if second_count != 0:
+                raise ValueError(
+                    f"Proof expected second recovery apply to recover 0 rows, got {second_count}"
+                )
+
+            receipt = Table(title="Milestone 6 Identity Recovery Proof Result")
+            receipt.add_column("Metric", style="cyan")
+            receipt.add_column("Value", style="green")
+            receipt.add_row("Chosen title", original_title)
+            receipt.add_row("Stale ID", stale_id)
+            receipt.add_row("Recovered ID", original_apple_id)
+            receipt.add_row("First recovery count", str(first_count))
+            receipt.add_row("Second recovery count", str(second_count))
+            receipt.add_row("Final recovery counts", str(final_recovery_plan.counts))
+            receipt.add_row("Final update counts", str(final_update_plan.counts))
+            console.print(receipt)
+            return True
+
+        except Exception as exc:
+            if stale_applied and not recovery_completed and notion is not None:
+                try:
+                    await notion.update_page_apple_reminder_id(
+                        original_page_id,
+                        original_apple_id,
+                    )
+                    if db is not None and target is not None:
+                        await db.replace_notion_mapping_apple_reminder_id(
+                            apple_sync_id=target.apple_sync_id,
+                            apple_reminder_id=original_apple_id,
+                            apple_calendar_name=apple_calendar,
+                            timestamp=datetime.now(timezone.utc),
+                        )
+                except Exception as cleanup_exc:
+                    console.print(
+                        f"[red]Milestone 6 cleanup failed:[/red] {cleanup_exc}"
+                    )
+            console.print(f"[red]Milestone 6 proof failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_recovery_proof())
     if not passed:
         raise typer.Exit(1)
 
