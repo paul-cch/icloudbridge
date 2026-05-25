@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Annotated, Optional
 
+import httpx
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -18,6 +19,15 @@ from icloudbridge.core.photos_sync import PhotoSyncEngine
 from icloudbridge.core.reminders_sync import RemindersSyncEngine
 from icloudbridge.core.rich_notes_export import RichNotesExporter
 from icloudbridge.core.sync import NotesSyncEngine
+from icloudbridge.sources.reminders.notion_adapter import (
+    DEFAULT_NOTION_API_VERSION,
+    DEFAULT_TASKS_DATA_SOURCE_ID,
+    NotionAuthError,
+    NotionSchemaReport,
+    NotionTasksAdapter,
+    PropertyCheck,
+    load_notion_token,
+)
 from icloudbridge.utils.logging import setup_logging
 from icloudbridge.utils.photos_db import PhotosDB
 from icloudbridge.utils.settings_db import get_config_path, set_config_path
@@ -941,6 +951,194 @@ def notes_reset(
 # Reminders subcommand group
 reminders_app = typer.Typer(help="Manage reminders synchronization")
 app.add_typer(reminders_app, name="reminders")
+
+
+def _format_check(check: PropertyCheck) -> str:
+    """Format a Notion property check for CLI output."""
+    if check.ok:
+        return "✓"
+    if not check.present:
+        return "missing"
+    return f"got {check.actual_type}"
+
+
+def _print_notion_schema_report(report: NotionSchemaReport) -> None:
+    """Print a Notion Tasks preflight schema report."""
+    status = "[green]PASS[/green]" if report.ok else "[red]FAIL[/red]"
+    console.print(
+        Panel(
+            f"{status}\n"
+            f"[bold]Data source:[/bold] {report.title}\n"
+            f"[bold]Data source ID:[/bold] {report.data_source_id}\n"
+            f"[bold]Database ID:[/bold] {report.database_id or 'unknown'}\n"
+            f"[bold]API version:[/bold] {report.api_version}",
+            title="Notion Tasks Schema",
+        )
+    )
+
+    table = Table(title="Required Properties")
+    table.add_column("Property", style="cyan")
+    table.add_column("Expected", style="green")
+    table.add_column("Result", style="magenta")
+    for check in report.required:
+        table.add_row(check.name, check.expected_type, _format_check(check))
+    console.print(table)
+
+    identity_table = Table(title="Sync Identity Properties")
+    identity_table.add_column("Property", style="cyan")
+    identity_table.add_column("Expected", style="green")
+    identity_table.add_column("Result", style="magenta")
+    for check in report.identity:
+        identity_table.add_row(check.name, check.expected_type, _format_check(check))
+    console.print(identity_table)
+
+    if report.optional:
+        optional_table = Table(title="Optional Properties")
+        optional_table.add_column("Property", style="cyan")
+        optional_table.add_column("Expected", style="green")
+        optional_table.add_column("Result", style="magenta")
+        for check in report.optional:
+            optional_table.add_row(check.name, check.expected_type, _format_check(check))
+        console.print(optional_table)
+
+    if report.status_options:
+        console.print("[cyan]Status options:[/cyan] " + ", ".join(report.status_options))
+    if report.source_options:
+        console.print("[cyan]Source options:[/cyan] " + ", ".join(report.source_options))
+    if report.area_options:
+        console.print("[cyan]Area options:[/cyan] " + ", ".join(report.area_options))
+
+    for warning in report.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {warning}")
+    for error in report.errors:
+        console.print(f"[red]Error:[/red] {error}")
+
+
+@reminders_app.command("notion-preflight")
+def reminders_notion_preflight(
+    data_source_id: str = typer.Option(
+        DEFAULT_TASKS_DATA_SOURCE_ID,
+        "--data-source-id",
+        help="Notion Tasks data source ID to inspect",
+    ),
+    apple_calendar: str = typer.Option(
+        "Notion Sync Test",
+        "--apple-calendar",
+        "-a",
+        help="Apple Reminders list to check for read access",
+    ),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+        help="Notion API token. Defaults to NOTION_API_TOKEN or ntn file auth.",
+    ),
+    api_version: str = typer.Option(
+        DEFAULT_NOTION_API_VERSION,
+        "--notion-version",
+        help="Notion API version header",
+    ),
+    skip_apple: bool = typer.Option(
+        False,
+        "--skip-apple",
+        help="Skip Apple Reminders access/list checks",
+    ),
+) -> None:
+    """Run read-only preflight checks for future Notion Tasks ↔ Apple Reminders sync."""
+
+    async def run_preflight() -> bool:
+        ok = True
+
+        try:
+            token = load_notion_token(notion_token)
+        except NotionAuthError as exc:
+            console.print(f"[red]Notion auth failed:[/red] {exc}")
+            return False
+
+        adapter = NotionTasksAdapter(token=token, api_version=api_version)
+        try:
+            report = await adapter.preflight_schema(data_source_id)
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            console.print(
+                f"[red]Notion schema check failed:[/red] "
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+            ok = False
+        except httpx.HTTPError as exc:
+            console.print(f"[red]Notion schema check failed:[/red] {exc}")
+            ok = False
+        else:
+            _print_notion_schema_report(report)
+            ok = report.ok
+
+        if skip_apple:
+            console.print("[yellow]Apple Reminders check skipped.[/yellow]")
+            return ok
+
+        from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+
+        try:
+            reminders_adapter = RemindersAdapter()
+            access_granted = await reminders_adapter.request_access()
+            if not access_granted:
+                console.print("[red]Apple Reminders access was not granted.[/red]")
+                return False
+
+            calendars = await reminders_adapter.list_calendars()
+            calendar_names = [cal.title for cal in calendars]
+            target = next((cal for cal in calendars if cal.title == apple_calendar), None)
+
+            table = Table(title="Apple Reminders Access")
+            table.add_column("Check", style="cyan")
+            table.add_column("Result", style="green")
+            table.add_row("Access granted", "✓")
+            table.add_row("Lists found", str(len(calendars)))
+            table.add_row(
+                f"Target list '{apple_calendar}'",
+                "✓" if target else "missing",
+            )
+            console.print(table)
+
+            if not target:
+                ok = False
+                console.print(
+                    "[yellow]Available lists:[/yellow] "
+                    + (", ".join(calendar_names) if calendar_names else "none")
+                )
+                console.print(
+                    f"[red]Error:[/red] Create an Apple Reminders list named "
+                    f"'{apple_calendar}' or pass --apple-calendar."
+                )
+            else:
+                reminders = await reminders_adapter.get_reminders(calendar_id=target.uuid)
+                console.print(
+                    f"[green]✓[/green] Read {len(reminders)} reminder(s) from "
+                    f"'{apple_calendar}' without writes."
+                )
+
+        except Exception as exc:
+            console.print(f"[red]Apple Reminders check failed:[/red] {exc}")
+            ok = False
+
+        if ok:
+            console.print(
+                "\n[green]Milestone 0 preflight passed for read-only checks.[/green]\n"
+                "[dim]Write capability is intentionally unverified until a disposable "
+                "Notion test row or test data source is provided.[/dim]"
+            )
+        else:
+            console.print(
+                "\n[red]Milestone 0 preflight failed.[/red]\n"
+                "[dim]No sync writes were attempted. Fix the reported schema/access "
+                "issues before implementing sync writes.[/dim]"
+            )
+
+        return ok
+
+    passed = asyncio.run(run_preflight())
+    if not passed:
+        raise typer.Exit(1)
 
 
 @reminders_app.command("sync")
