@@ -27,6 +27,7 @@ from icloudbridge.core.notion_reminders_readonly import (
     assert_proof_ready_plan,
     build_apple_snapshot,
     build_bidirectional_update_plan,
+    build_deletion_grace_plan,
     build_identity_recovery_plan,
     build_notion_snapshot,
     build_proof_mutation,
@@ -34,6 +35,7 @@ from icloudbridge.core.notion_reminders_readonly import (
     build_readonly_sync_plan,
     execute_create_apple_plan,
     execute_create_notion_plan,
+    execute_deletion_grace_plan,
     execute_identity_recovery_plan,
     execute_update_apple_plan,
     execute_update_notion_plan,
@@ -2087,6 +2089,38 @@ def _print_identity_recovery_plan(title: str, plan) -> None:
     console.print(table)
 
 
+def _print_deletion_grace_plan(title: str, plan) -> None:
+    summary = Table(title=title)
+    summary.add_column("Action", style="cyan")
+    summary.add_column("Count", style="green", justify="right")
+    for kind in (
+        "NOOP",
+        "MISSING_APPLE_FIRST_SEEN",
+        "MISSING_APPLE_STILL_MISSING",
+        "MISSING_NOTION_FIRST_SEEN",
+        "MISSING_NOTION_STILL_MISSING",
+        "UNTRACKED",
+    ):
+        summary.add_row(kind, str(plan.counts[kind]))
+    console.print(summary)
+
+    table = Table(title="Deletion Grace Actions")
+    table.add_column("Action", style="cyan")
+    table.add_column("Title", style="white")
+    table.add_column("Apple Sync ID", style="green")
+    table.add_column("Apple Reminder ID", style="blue")
+    table.add_column("Reason", style="yellow")
+    for action in plan.actions:
+        table.add_row(
+            action.kind,
+            action.title,
+            action.apple_sync_id or "",
+            action.apple_reminder_id or "",
+            action.reason,
+        )
+    console.print(table)
+
+
 async def _read_notion_update_plan(
     data_source_id: str,
     apple_calendar: str,
@@ -2168,6 +2202,47 @@ async def _read_notion_identity_recovery_plan(
     mappings = await db.get_all_notion_reminder_mappings()
     recovery_plan = build_identity_recovery_plan(notion_tasks, apple_reminders, mappings)
     return recovery_plan, notion, reminders, db
+
+
+async def _read_notion_deletion_grace_plan(
+    data_source_id: str,
+    apple_calendar: str,
+    notion_token: str | None,
+    api_version: str,
+    notion_page_size: int,
+    db_path: Path,
+):
+    from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+    from icloudbridge.utils.db import NotionRemindersDB
+
+    token = load_notion_token(notion_token)
+    notion = NotionTasksAdapter(token=token, api_version=api_version)
+    report = await notion.preflight_schema(data_source_id)
+    if not report.ok:
+        _print_notion_schema_report(report)
+        return None, None, None, None, None, None, None
+
+    notion_tasks = await notion.query_tasks_with_apple_sync_id(
+        data_source_id=data_source_id,
+        page_size=notion_page_size,
+    )
+    reminders = RemindersAdapter()
+    if not await reminders.request_access():
+        console.print("[red]Apple Reminders access was not granted.[/red]")
+        return None, None, None, None, None, None, None
+
+    calendars = await reminders.list_calendars()
+    target_calendar = next((cal for cal in calendars if cal.title == apple_calendar), None)
+    if not target_calendar:
+        console.print(f"[red]Apple Reminders list not found:[/red] {apple_calendar!r}")
+        return None, None, None, None, None, None, None
+
+    apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+    db = NotionRemindersDB(db_path)
+    await db.initialize()
+    mappings = await db.get_all_notion_reminder_mappings()
+    grace_plan = build_deletion_grace_plan(notion_tasks, apple_reminders, mappings)
+    return grace_plan, notion, reminders, db, notion_tasks, apple_reminders, mappings
 
 
 @reminders_app.command("notion-recovery-plan")
@@ -2319,6 +2394,344 @@ def reminders_notion_recover_identity(
             return False
 
     passed = asyncio.run(run_recover_identity())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-deletion-grace-plan")
+def reminders_notion_deletion_grace_plan(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+) -> None:
+    """Plan detection-only deletion/cancellation grace state without writes."""
+
+    async def run_deletion_grace_plan() -> bool:
+        try:
+            grace_plan, _, _, _, _, _, _ = await _read_notion_deletion_grace_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+        except NotionAuthError as exc:
+            console.print(f"[red]Notion auth failed:[/red] {exc}")
+            return False
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            console.print(
+                f"[red]Deletion grace planning read failed:[/red] "
+                f"HTTP {response.status_code} {response.reason_phrase}"
+            )
+            return False
+        except Exception as exc:
+            console.print(f"[red]Deletion grace planning failed:[/red] {exc}")
+            return False
+
+        if grace_plan is None:
+            return False
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                f"[yellow]Warning:[/yellow] planning against non-test list "
+                f"{apple_calendar!r}; this command is read-only."
+            )
+        _print_deletion_grace_plan("Gate J Deletion Grace Plan", grace_plan)
+        console.print("\n[green]No writes attempted.[/green]")
+        return True
+
+    passed = asyncio.run(run_deletion_grace_plan())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-deletion-grace-record")
+def reminders_notion_deletion_grace_record(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    apply: bool = typer.Option(False, "--apply", help="Actually record missing markers"),
+) -> None:
+    """Record detection-only deletion/cancellation grace markers."""
+
+    async def run_deletion_grace_record() -> bool:
+        if apple_calendar != "Notion Sync Test":
+            console.print(
+                "[red]Refusing to run:[/red] deletion grace recording is limited to "
+                "'Notion Sync Test'."
+            )
+            return False
+        try:
+            grace_plan, _, _, db, _, _, _ = await _read_notion_deletion_grace_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if grace_plan is None or db is None:
+                return False
+            _print_deletion_grace_plan("Gate J Deletion Grace Plan", grace_plan)
+            if not apply:
+                console.print(
+                    "\n[yellow]Dry run only.[/yellow] Pass --apply to record markers."
+                )
+                return True
+
+            result = await execute_deletion_grace_plan(
+                grace_plan,
+                apple_calendar_name=apple_calendar,
+                db=db,
+            )
+            result_table = Table(title="Gate J Record Result")
+            result_table.add_column("Metric", style="cyan")
+            result_table.add_column("Count", style="green", justify="right")
+            result_table.add_row("Marked missing Apple", str(result.marked_missing_apple))
+            result_table.add_row("Marked missing Notion", str(result.marked_missing_notion))
+            result_table.add_row("Cleared markers", str(result.cleared_markers))
+            result_table.add_row("Skipped", str(result.skipped))
+            console.print(result_table)
+
+            post_plan, _, _, _, _, _, _ = await _read_notion_deletion_grace_plan(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+            )
+            if post_plan is None:
+                return False
+            _print_deletion_grace_plan("Post-Record Deletion Grace Plan", post_plan)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Deletion grace recording failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_deletion_grace_record())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-deletion-grace-proof")
+def reminders_notion_deletion_grace_proof(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option("Notion Sync Test", "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    apply: bool = typer.Option(False, "--apply", help="Actually run the proof"),
+) -> None:
+    """Run the Gate J detection-only deletion/cancellation grace proof."""
+
+    class ProofDeletionGraceDB:
+        def __init__(self):
+            self.missing_apple = []
+            self.missing_notion = []
+            self.cleared = []
+
+        async def mark_notion_reminder_missing_apple(self, apple_sync_id, timestamp):
+            self.missing_apple.append((apple_sync_id, timestamp))
+
+        async def mark_notion_reminder_missing_notion(self, apple_sync_id, timestamp):
+            self.missing_notion.append((apple_sync_id, timestamp))
+
+        async def clear_notion_reminder_missing_markers(self, apple_sync_id, timestamp):
+            self.cleared.append((apple_sync_id, timestamp))
+
+    async def run_deletion_grace_proof() -> bool:
+        if apple_calendar != "Notion Sync Test":
+            console.print("[red]Refusing proof:[/red] only 'Notion Sync Test' is allowed.")
+            return False
+        if not apply:
+            console.print("[red]Refusing proof:[/red] --apply is required for proof.")
+            return False
+
+        try:
+            live_plan, _, _, _, notion_tasks, apple_reminders, mappings = (
+                await _read_notion_deletion_grace_plan(
+                    data_source_id,
+                    apple_calendar,
+                    notion_token,
+                    api_version,
+                    notion_page_size,
+                    ctx.obj["config"].reminders_db_path,
+                )
+            )
+            if (
+                live_plan is None
+                or notion_tasks is None
+                or apple_reminders is None
+                or mappings is None
+            ):
+                return False
+            if live_plan.counts["NOOP"] != 2 or any(
+                live_plan.counts[kind]
+                for kind in live_plan.counts
+                if kind != "NOOP"
+            ):
+                raise ValueError(
+                    f"Proof requires exactly two live NOOP mappings, got {live_plan.counts}"
+                )
+
+            target = next(action for action in live_plan.actions if action.kind == "NOOP")
+            target_sync_id = target.apple_sync_id or ""
+            target_apple_id = target.apple_reminder_id or ""
+            target_page_id = target.notion_page_id or ""
+
+            apple_missing_first = build_deletion_grace_plan(
+                notion_tasks,
+                [
+                    reminder
+                    for reminder in apple_reminders
+                    if getattr(reminder, "uuid", None) != target_apple_id
+                ],
+                mappings,
+            )
+            apple_missing_second = build_deletion_grace_plan(
+                notion_tasks,
+                [
+                    reminder
+                    for reminder in apple_reminders
+                    if getattr(reminder, "uuid", None) != target_apple_id
+                ],
+                [
+                    {
+                        **mapping,
+                        "missing_apple_seen_at": "2026-05-26T00:00:00+00:00",
+                    }
+                    if mapping.get("apple_sync_id") == target_sync_id
+                    else mapping
+                    for mapping in mappings
+                ],
+            )
+            notion_missing_first = build_deletion_grace_plan(
+                [task for task in notion_tasks if task.page_id != target_page_id],
+                apple_reminders,
+                mappings,
+            )
+            notion_missing_second = build_deletion_grace_plan(
+                [task for task in notion_tasks if task.page_id != target_page_id],
+                apple_reminders,
+                [
+                    {
+                        **mapping,
+                        "missing_notion_seen_at": "2026-05-26T00:00:00+00:00",
+                    }
+                    if mapping.get("apple_sync_id") == target_sync_id
+                    else mapping
+                    for mapping in mappings
+                ],
+            )
+            resolved_plan = build_deletion_grace_plan(
+                notion_tasks,
+                apple_reminders,
+                [
+                    {
+                        **mapping,
+                        "missing_apple_seen_at": "2026-05-26T00:00:00+00:00",
+                        "missing_notion_seen_at": None,
+                    }
+                    if mapping.get("apple_sync_id") == target_sync_id
+                    else mapping
+                    for mapping in mappings
+                ],
+            )
+
+            expected = {
+                "apple_missing_first": (
+                    apple_missing_first,
+                    "MISSING_APPLE_FIRST_SEEN",
+                ),
+                "apple_missing_second": (
+                    apple_missing_second,
+                    "MISSING_APPLE_STILL_MISSING",
+                ),
+                "notion_missing_first": (
+                    notion_missing_first,
+                    "MISSING_NOTION_FIRST_SEEN",
+                ),
+                "notion_missing_second": (
+                    notion_missing_second,
+                    "MISSING_NOTION_STILL_MISSING",
+                ),
+                "resolved": (resolved_plan, "NOOP"),
+            }
+            for label, (plan, required_kind) in expected.items():
+                if not any(
+                    action.apple_sync_id == target_sync_id and action.kind == required_kind
+                    for action in plan.actions
+                ):
+                    raise ValueError(f"{label} did not produce {required_kind}")
+
+            proof_db = ProofDeletionGraceDB()
+            first_result = await execute_deletion_grace_plan(
+                apple_missing_first,
+                apple_calendar_name=apple_calendar,
+                db=proof_db,
+            )
+            second_result = await execute_deletion_grace_plan(
+                notion_missing_first,
+                apple_calendar_name=apple_calendar,
+                db=proof_db,
+            )
+            clear_result = await execute_deletion_grace_plan(
+                resolved_plan,
+                apple_calendar_name=apple_calendar,
+                db=proof_db,
+            )
+            if first_result.marked_missing_apple != 1:
+                raise ValueError("Proof expected one missing-Apple marker write")
+            if second_result.marked_missing_notion != 1:
+                raise ValueError("Proof expected one missing-Notion marker write")
+            if clear_result.cleared_markers != 1:
+                raise ValueError("Proof expected one marker clear")
+
+            receipt = Table(title="Gate J Deletion Grace Proof Result")
+            receipt.add_column("Metric", style="cyan")
+            receipt.add_column("Value", style="green")
+            receipt.add_row("Chosen title", target.title)
+            receipt.add_row("Live counts", str(live_plan.counts))
+            receipt.add_row("Apple missing first", str(apple_missing_first.counts))
+            receipt.add_row("Apple missing second", str(apple_missing_second.counts))
+            receipt.add_row("Notion missing first", str(notion_missing_first.counts))
+            receipt.add_row("Notion missing second", str(notion_missing_second.counts))
+            receipt.add_row("Resolved counts", str(resolved_plan.counts))
+            receipt.add_row("Proof DB missing Apple writes", str(len(proof_db.missing_apple)))
+            receipt.add_row("Proof DB missing Notion writes", str(len(proof_db.missing_notion)))
+            receipt.add_row("Proof DB clear writes", str(len(proof_db.cleared)))
+            console.print(receipt)
+            console.print(
+                "[dim]No Notion pages or Apple reminders were deleted, cancelled, "
+                "completed, or content-edited.[/dim]"
+            )
+            return True
+        except Exception as exc:
+            console.print(f"[red]Gate J proof failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_deletion_grace_proof())
     if not passed:
         raise typer.Exit(1)
 

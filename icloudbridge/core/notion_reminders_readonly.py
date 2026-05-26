@@ -145,6 +145,48 @@ class IdentityRecoveryPlan:
 
 
 @dataclass
+class DeletionGraceAction:
+    """A detection-only missing-side action for deletion/cancellation grace."""
+
+    kind: str
+    title: str
+    apple_sync_id: str | None
+    notion_page_id: str | None
+    apple_reminder_id: str | None
+    reason: str = ""
+    notion_task: NotionTask | None = None
+    apple_reminder: Any | None = None
+    mapping: dict[str, Any] | None = None
+
+
+@dataclass
+class DeletionGracePlan:
+    """Detection-only plan for two-run missing-side grace handling."""
+
+    actions: list[DeletionGraceAction] = field(default_factory=list)
+
+    @property
+    def counts(self) -> dict[str, int]:
+        """Count deletion grace actions by kind."""
+        return {
+            "NOOP": sum(1 for action in self.actions if action.kind == "NOOP"),
+            "MISSING_APPLE_FIRST_SEEN": sum(
+                1 for action in self.actions if action.kind == "MISSING_APPLE_FIRST_SEEN"
+            ),
+            "MISSING_APPLE_STILL_MISSING": sum(
+                1 for action in self.actions if action.kind == "MISSING_APPLE_STILL_MISSING"
+            ),
+            "MISSING_NOTION_FIRST_SEEN": sum(
+                1 for action in self.actions if action.kind == "MISSING_NOTION_FIRST_SEEN"
+            ),
+            "MISSING_NOTION_STILL_MISSING": sum(
+                1 for action in self.actions if action.kind == "MISSING_NOTION_STILL_MISSING"
+            ),
+            "UNTRACKED": sum(1 for action in self.actions if action.kind == "UNTRACKED"),
+        }
+
+
+@dataclass
 class CreateAppleExecutionResult:
     """Stats from applying CREATE_APPLE actions."""
 
@@ -183,6 +225,16 @@ class IdentityRecoveryExecutionResult:
 
     recovered: int = 0
     skipped_non_recovery: int = 0
+
+
+@dataclass
+class DeletionGraceExecutionResult:
+    """Stats from recording missing-side grace markers."""
+
+    marked_missing_apple: int = 0
+    marked_missing_notion: int = 0
+    cleared_markers: int = 0
+    skipped: int = 0
 
 
 @dataclass
@@ -584,6 +636,129 @@ def build_identity_recovery_plan(
     return IdentityRecoveryPlan(actions=actions)
 
 
+def build_deletion_grace_plan(
+    notion_tasks: list[NotionTask],
+    apple_reminders: list[Any],
+    mappings: list[dict[str, Any]],
+) -> DeletionGracePlan:
+    """Build a detection-only two-run grace plan for mapped missing items."""
+    notion_by_page_id = {task.page_id: task for task in notion_tasks}
+    notion_by_sync_id = {
+        task.apple_sync_id: task for task in notion_tasks if task.apple_sync_id
+    }
+    apple_by_id = {
+        getattr(reminder, "uuid", None): reminder for reminder in apple_reminders
+    }
+    actions: list[DeletionGraceAction] = []
+
+    for mapping in mappings:
+        apple_sync_id = mapping.get("apple_sync_id")
+        notion_page_id = mapping.get("notion_page_id")
+        apple_reminder_id = mapping.get("apple_reminder_id")
+        if not apple_sync_id or not notion_page_id or not apple_reminder_id:
+            actions.append(
+                DeletionGraceAction(
+                    kind="UNTRACKED",
+                    title="",
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=notion_page_id,
+                    apple_reminder_id=apple_reminder_id,
+                    reason="missing_mapping_identity",
+                    mapping=mapping,
+                )
+            )
+            continue
+
+        task = notion_by_page_id.get(notion_page_id) or notion_by_sync_id.get(apple_sync_id)
+        reminder = apple_by_id.get(apple_reminder_id)
+        title = (
+            getattr(task, "title", None)
+            or getattr(reminder, "title", None)
+            or mapping.get("title")
+            or apple_sync_id
+        )
+
+        if task is not None and reminder is not None:
+            actions.append(
+                DeletionGraceAction(
+                    kind="NOOP",
+                    title=title,
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=notion_page_id,
+                    apple_reminder_id=apple_reminder_id,
+                    reason="mapped_pair_present",
+                    notion_task=task,
+                    apple_reminder=reminder,
+                    mapping=mapping,
+                )
+            )
+        elif task is not None:
+            kind = (
+                "MISSING_APPLE_STILL_MISSING"
+                if mapping.get("missing_apple_seen_at")
+                else "MISSING_APPLE_FIRST_SEEN"
+            )
+            actions.append(
+                DeletionGraceAction(
+                    kind=kind,
+                    title=title,
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=notion_page_id,
+                    apple_reminder_id=apple_reminder_id,
+                    reason="mapped_apple_absent",
+                    notion_task=task,
+                    mapping=mapping,
+                )
+            )
+        elif reminder is not None:
+            kind = (
+                "MISSING_NOTION_STILL_MISSING"
+                if mapping.get("missing_notion_seen_at")
+                else "MISSING_NOTION_FIRST_SEEN"
+            )
+            actions.append(
+                DeletionGraceAction(
+                    kind=kind,
+                    title=title,
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=notion_page_id,
+                    apple_reminder_id=apple_reminder_id,
+                    reason="mapped_notion_absent",
+                    apple_reminder=reminder,
+                    mapping=mapping,
+                )
+            )
+        else:
+            actions.append(
+                DeletionGraceAction(
+                    kind="UNTRACKED",
+                    title=title,
+                    apple_sync_id=apple_sync_id,
+                    notion_page_id=notion_page_id,
+                    apple_reminder_id=apple_reminder_id,
+                    reason="both_sides_absent",
+                    mapping=mapping,
+                )
+            )
+
+    order = {
+        "NOOP": 0,
+        "MISSING_APPLE_FIRST_SEEN": 1,
+        "MISSING_APPLE_STILL_MISSING": 2,
+        "MISSING_NOTION_FIRST_SEEN": 3,
+        "MISSING_NOTION_STILL_MISSING": 4,
+        "UNTRACKED": 5,
+    }
+    actions.sort(
+        key=lambda action: (
+            order[action.kind],
+            action.title,
+            action.apple_sync_id or "",
+        )
+    )
+    return DeletionGracePlan(actions=actions)
+
+
 def build_readonly_match_report(
     notion_tasks: list[NotionTask],
     apple_reminders: list[Any],
@@ -938,4 +1113,48 @@ async def execute_identity_recovery_plan(
             timestamp=timestamp,
         )
         result.recovered += 1
+    return result
+
+
+async def execute_deletion_grace_plan(
+    plan: DeletionGracePlan,
+    apple_calendar_name: str,
+    db: Any,
+) -> DeletionGraceExecutionResult:
+    """Record only missing-side grace markers for the test slice."""
+    if apple_calendar_name != "Notion Sync Test":
+        raise ValueError("Gate J deletion grace recording is limited to 'Notion Sync Test'")
+
+    result = DeletionGraceExecutionResult()
+    timestamp = datetime.now(timezone.utc)
+    for action in plan.actions:
+        if not action.apple_sync_id:
+            result.skipped += 1
+            continue
+
+        if action.kind == "NOOP":
+            marker_present = bool(
+                (action.mapping or {}).get("missing_apple_seen_at")
+                or (action.mapping or {}).get("missing_notion_seen_at")
+            )
+            if marker_present:
+                await db.clear_notion_reminder_missing_markers(
+                    apple_sync_id=action.apple_sync_id,
+                    timestamp=timestamp,
+                )
+                result.cleared_markers += 1
+        elif action.kind == "MISSING_APPLE_FIRST_SEEN":
+            await db.mark_notion_reminder_missing_apple(
+                apple_sync_id=action.apple_sync_id,
+                timestamp=timestamp,
+            )
+            result.marked_missing_apple += 1
+        elif action.kind == "MISSING_NOTION_FIRST_SEEN":
+            await db.mark_notion_reminder_missing_notion(
+                apple_sync_id=action.apple_sync_id,
+                timestamp=timestamp,
+            )
+            result.marked_missing_notion += 1
+        else:
+            result.skipped += 1
     return result

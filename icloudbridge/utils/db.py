@@ -599,6 +599,8 @@ class NotionRemindersDB:
                 "last_apple_snapshot_hash",
                 "last_notion_snapshot_json",
                 "last_apple_snapshot_json",
+                "missing_apple_seen_at",
+                "missing_notion_seen_at",
             ):
                 if column not in columns:
                     await db.execute(
@@ -746,6 +748,63 @@ class NotionRemindersDB:
                     timestamp.isoformat(),
                     apple_sync_id,
                 ),
+            )
+            await db.commit()
+
+    async def mark_notion_reminder_missing_apple(
+        self,
+        apple_sync_id: str,
+        timestamp: datetime,
+    ) -> None:
+        """Record the first observed missing Apple reminder for a mapping."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE notion_reminder_mapping
+                SET missing_apple_seen_at = COALESCE(missing_apple_seen_at, ?),
+                    missing_notion_seen_at = NULL,
+                    updated_at = ?
+                WHERE apple_sync_id = ?
+                """,
+                (timestamp.isoformat(), timestamp.isoformat(), apple_sync_id),
+            )
+            await db.commit()
+
+    async def mark_notion_reminder_missing_notion(
+        self,
+        apple_sync_id: str,
+        timestamp: datetime,
+    ) -> None:
+        """Record the first observed missing Notion row for a mapping."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE notion_reminder_mapping
+                SET missing_notion_seen_at = COALESCE(missing_notion_seen_at, ?),
+                    missing_apple_seen_at = NULL,
+                    updated_at = ?
+                WHERE apple_sync_id = ?
+                """,
+                (timestamp.isoformat(), timestamp.isoformat(), apple_sync_id),
+            )
+            await db.commit()
+
+    async def clear_notion_reminder_missing_markers(
+        self,
+        apple_sync_id: str,
+        timestamp: datetime,
+    ) -> None:
+        """Clear missing-side markers after both mapped sides are present again."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE notion_reminder_mapping
+                SET missing_apple_seen_at = NULL,
+                    missing_notion_seen_at = NULL,
+                    updated_at = ?
+                WHERE apple_sync_id = ?
+                """,
+                (timestamp.isoformat(), apple_sync_id),
             )
             await db.commit()
 

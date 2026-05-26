@@ -9,11 +9,13 @@ from icloudbridge.core.notion_reminders_readonly import (
     assert_proof_ready_plan,
     build_apple_snapshot,
     build_bidirectional_update_plan,
+    build_deletion_grace_plan,
     build_identity_recovery_plan,
     build_notion_snapshot,
     build_proof_mutation,
     execute_create_apple_plan,
     execute_create_notion_plan,
+    execute_deletion_grace_plan,
     execute_identity_recovery_plan,
     execute_update_apple_plan,
     execute_update_notion_plan,
@@ -428,6 +430,80 @@ def test_identity_recovery_plan_leaves_current_matches_as_noop():
     assert plan.counts == {"NOOP": 1, "RECOVER_APPLE_ID": 0, "UNRECOVERED": 0}
 
 
+def test_deletion_grace_plan_reports_existing_mapped_rows_as_noop():
+    task = _notion_task("[SYNC TEST] Same", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("[SYNC TEST] Same", "apple-1")
+
+    plan = build_deletion_grace_plan([task], [apple], [_mapping_for(task, apple)])
+
+    assert plan.counts["NOOP"] == 1
+    assert plan.actions[0].kind == "NOOP"
+    assert plan.actions[0].reason == "mapped_pair_present"
+
+
+def test_deletion_grace_plan_detects_first_and_second_missing_apple_runs():
+    task = _notion_task("[SYNC TEST] Same", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("[SYNC TEST] Same", "apple-1")
+    mapping = _mapping_for(task, apple)
+
+    first = build_deletion_grace_plan([task], [], [mapping])
+    second = build_deletion_grace_plan(
+        [task],
+        [],
+        [{**mapping, "missing_apple_seen_at": "2026-05-26T00:00:00+00:00"}],
+    )
+
+    assert first.actions[0].kind == "MISSING_APPLE_FIRST_SEEN"
+    assert second.actions[0].kind == "MISSING_APPLE_STILL_MISSING"
+
+
+def test_deletion_grace_plan_detects_first_and_second_missing_notion_runs():
+    task = _notion_task("[SYNC TEST] Same", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("[SYNC TEST] Same", "apple-1")
+    mapping = _mapping_for(task, apple)
+
+    first = build_deletion_grace_plan([], [apple], [mapping])
+    second = build_deletion_grace_plan(
+        [],
+        [apple],
+        [{**mapping, "missing_notion_seen_at": "2026-05-26T00:00:00+00:00"}],
+    )
+
+    assert first.actions[0].kind == "MISSING_NOTION_FIRST_SEEN"
+    assert second.actions[0].kind == "MISSING_NOTION_STILL_MISSING"
+
+
+def test_deletion_grace_plan_resolved_mapping_returns_to_noop_with_marker():
+    task = _notion_task("[SYNC TEST] Same", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("[SYNC TEST] Same", "apple-1")
+    mapping = {
+        **_mapping_for(task, apple),
+        "missing_apple_seen_at": "2026-05-26T00:00:00+00:00",
+    }
+
+    plan = build_deletion_grace_plan([task], [apple], [mapping])
+
+    assert plan.actions[0].kind == "NOOP"
+    assert plan.actions[0].mapping["missing_apple_seen_at"] is not None
+
+
+def test_deletion_grace_plan_reports_untracked_for_bad_or_absent_mappings():
+    both_absent = {
+        "apple_sync_id": "sync-1",
+        "notion_page_id": "page-missing",
+        "apple_reminder_id": "apple-missing",
+    }
+    missing_identity = {"apple_sync_id": "sync-2"}
+
+    plan = build_deletion_grace_plan([], [], [both_absent, missing_identity])
+
+    assert [action.kind for action in plan.actions] == ["UNTRACKED", "UNTRACKED"]
+    assert {action.reason for action in plan.actions} == {
+        "both_sides_absent",
+        "missing_mapping_identity",
+    }
+
+
 class FakeRemindersAdapter:
     def __init__(self):
         self.create_calls = []
@@ -558,6 +634,22 @@ class FakeRecoveryDB:
         self.snapshots.append((apple_sync_id, notion_snapshot, apple_snapshot, timestamp))
 
 
+class FakeDeletionGraceDB:
+    def __init__(self):
+        self.missing_apple = []
+        self.missing_notion = []
+        self.cleared = []
+
+    async def mark_notion_reminder_missing_apple(self, apple_sync_id, timestamp):
+        self.missing_apple.append((apple_sync_id, timestamp))
+
+    async def mark_notion_reminder_missing_notion(self, apple_sync_id, timestamp):
+        self.missing_notion.append((apple_sync_id, timestamp))
+
+    async def clear_notion_reminder_missing_markers(self, apple_sync_id, timestamp):
+        self.cleared.append((apple_sync_id, timestamp))
+
+
 class FakeRecoveryNotion:
     def __init__(self):
         self.updated_ids = []
@@ -565,6 +657,80 @@ class FakeRecoveryNotion:
     async def update_page_apple_reminder_id(self, page_id, apple_reminder_id):
         self.updated_ids.append((page_id, apple_reminder_id))
         return {"id": page_id, "properties": {}}
+
+
+@pytest.mark.asyncio
+async def test_execute_deletion_grace_plan_records_only_marker_updates():
+    task = _notion_task("[SYNC TEST] Same", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("[SYNC TEST] Same", "apple-1")
+    missing_apple_plan = build_deletion_grace_plan([task], [], [_mapping_for(task, apple)])
+    missing_notion_plan = build_deletion_grace_plan([], [apple], [_mapping_for(task, apple)])
+    resolved_plan = build_deletion_grace_plan(
+        [task],
+        [apple],
+        [
+            {
+                **_mapping_for(task, apple),
+                "missing_apple_seen_at": "2026-05-26T00:00:00+00:00",
+            }
+        ],
+    )
+    db = FakeDeletionGraceDB()
+
+    missing_apple = await execute_deletion_grace_plan(
+        missing_apple_plan,
+        apple_calendar_name="Notion Sync Test",
+        db=db,
+    )
+    missing_notion = await execute_deletion_grace_plan(
+        missing_notion_plan,
+        apple_calendar_name="Notion Sync Test",
+        db=db,
+    )
+    resolved = await execute_deletion_grace_plan(
+        resolved_plan,
+        apple_calendar_name="Notion Sync Test",
+        db=db,
+    )
+
+    assert missing_apple.marked_missing_apple == 1
+    assert missing_notion.marked_missing_notion == 1
+    assert resolved.cleared_markers == 1
+    assert db.missing_apple[0][0] == "sync-1"
+    assert db.missing_notion[0][0] == "sync-1"
+    assert db.cleared[0][0] == "sync-1"
+
+
+@pytest.mark.asyncio
+async def test_execute_deletion_grace_plan_refuses_non_test_list_and_skips_second_runs():
+    task = _notion_task("[SYNC TEST] Same", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("[SYNC TEST] Same", "apple-1")
+    second_plan = build_deletion_grace_plan(
+        [task],
+        [],
+        [
+            {
+                **_mapping_for(task, apple),
+                "missing_apple_seen_at": "2026-05-26T00:00:00+00:00",
+            }
+        ],
+    )
+    db = FakeDeletionGraceDB()
+
+    result = await execute_deletion_grace_plan(
+        second_plan,
+        apple_calendar_name="Notion Sync Test",
+        db=db,
+    )
+
+    assert result.skipped == 1
+    assert db.missing_apple == []
+    with pytest.raises(ValueError, match="Notion Sync Test"):
+        await execute_deletion_grace_plan(
+            second_plan,
+            apple_calendar_name="Real List",
+            db=db,
+        )
 
 
 @pytest.mark.asyncio
