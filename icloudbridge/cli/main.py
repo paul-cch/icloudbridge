@@ -36,6 +36,7 @@ from icloudbridge.core.notion_reminders_readonly import (
     execute_production_create_notion_plan,
     execute_production_deletion_grace_plan,
     execute_production_identity_recovery_plan,
+    execute_production_receipt_cleanup_plan,
     execute_production_update_apple_plan,
     execute_production_update_notion_plan,
     execute_update_apple_plan,
@@ -2914,6 +2915,82 @@ def reminders_notion_production_deletion_grace_record(
             return False
 
     passed = asyncio.run(run_grace())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-cleanup-receipts")
+def reminders_notion_production_cleanup_receipts(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(..., "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    expected_receipts: int = typer.Option(..., "--expected-receipts", min=0),
+    max_receipts: Optional[int] = typer.Option(None, "--max-receipts", min=0),
+    apply: bool = typer.Option(False, "--apply", help="Actually delete local receipts"),
+    confirm_production: bool = typer.Option(False, "--confirm-production"),
+) -> None:
+    """Remove local production receipts only after both synced sides are gone."""
+
+    async def run_cleanup() -> bool:
+        if not _confirm_production(apply, confirm_production):
+            return False
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+            if context is None:
+                return False
+            grace_plan = context["grace_plan"]
+            _print_deletion_grace_plan("Production Receipt Cleanup Plan", grace_plan)
+            cleanup_count = sum(
+                1
+                for action in grace_plan.actions
+                if action.kind == "UNTRACKED" and action.reason == "both_sides_absent"
+            )
+            if not _expected_count_matches(
+                "receipt cleanups",
+                cleanup_count,
+                expected_receipts,
+            ):
+                return False
+            if not apply:
+                console.print(
+                    "\n[yellow]Dry run only.[/yellow] Pass --apply to delete local receipts."
+                )
+                return True
+            result = await execute_production_receipt_cleanup_plan(
+                grace_plan,
+                apple_calendar_name=apple_calendar,
+                db=context["db"],
+                max_receipts=max_receipts
+                if max_receipts is not None
+                else ctx.obj["config"].reminders.notion_production_receipt_cleanup_limit,
+            )
+            table = Table(title="Production Receipt Cleanup Apply Result")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Count", style="green", justify="right")
+            table.add_row("Deleted local receipts", str(result.deleted_receipts))
+            table.add_row("Skipped", str(result.skipped))
+            console.print(table)
+            return result.deleted_receipts == expected_receipts
+        except Exception as exc:
+            console.print(f"[red]Production receipt cleanup failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_cleanup())
     if not passed:
         raise typer.Exit(1)
 

@@ -808,6 +808,33 @@ class NotionRemindersDB:
             )
             await db.commit()
 
+    async def delete_notion_reminder_mapping(
+        self,
+        apple_sync_id: str,
+        notion_page_id: str,
+        apple_reminder_id: str,
+        apple_calendar_name: str,
+    ) -> int:
+        """Delete one exact Notion reminder mapping receipt."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                DELETE FROM notion_reminder_mapping
+                WHERE apple_sync_id = ?
+                  AND notion_page_id = ?
+                  AND apple_reminder_id = ?
+                  AND apple_calendar_name = ?
+                """,
+                (
+                    apple_sync_id,
+                    notion_page_id,
+                    apple_reminder_id,
+                    apple_calendar_name,
+                ),
+            )
+            await db.commit()
+            return cursor.rowcount
+
 
 class PasswordsDB:
     """

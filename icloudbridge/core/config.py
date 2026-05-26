@@ -159,6 +159,7 @@ class RemindersConfig(BaseSettings):
     notion_production_create_limit: int = 5
     notion_production_update_limit: int = 5
     notion_production_recovery_limit: int = 1
+    notion_production_receipt_cleanup_limit: int = 1
 
     # Legacy fields for backward compatibility (deprecated)
     apple_calendar: str | None = None

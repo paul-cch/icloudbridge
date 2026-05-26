@@ -21,6 +21,7 @@ from icloudbridge.core.notion_reminders_readonly import (
     execute_identity_recovery_plan,
     execute_production_baseline_plan,
     execute_production_create_notion_plan,
+    execute_production_receipt_cleanup_plan,
     execute_update_apple_plan,
     execute_update_notion_plan,
     map_apple_priority_to_notion,
@@ -641,6 +642,7 @@ class FakeDeletionGraceDB:
         self.missing_apple = []
         self.missing_notion = []
         self.cleared = []
+        self.deleted = []
 
     async def mark_notion_reminder_missing_apple(self, apple_sync_id, timestamp):
         self.missing_apple.append((apple_sync_id, timestamp))
@@ -650,6 +652,18 @@ class FakeDeletionGraceDB:
 
     async def clear_notion_reminder_missing_markers(self, apple_sync_id, timestamp):
         self.cleared.append((apple_sync_id, timestamp))
+
+    async def delete_notion_reminder_mapping(
+        self,
+        apple_sync_id,
+        notion_page_id,
+        apple_reminder_id,
+        apple_calendar_name,
+    ):
+        self.deleted.append(
+            (apple_sync_id, notion_page_id, apple_reminder_id, apple_calendar_name)
+        )
+        return 1
 
 
 class FakeRecoveryNotion:
@@ -732,6 +746,56 @@ async def test_execute_deletion_grace_plan_refuses_non_test_list_and_skips_secon
             second_plan,
             apple_calendar_name="Real List",
             db=db,
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_production_receipt_cleanup_plan_deletes_only_both_absent_receipts():
+    both_absent = {
+        "apple_sync_id": "sync-1",
+        "notion_page_id": "page-missing",
+        "apple_reminder_id": "apple-missing",
+        "apple_calendar_name": "Life",
+    }
+    missing_identity = {"apple_sync_id": "sync-2", "apple_calendar_name": "Life"}
+    plan = build_deletion_grace_plan([], [], [both_absent, missing_identity])
+    db = FakeDeletionGraceDB()
+
+    result = await execute_production_receipt_cleanup_plan(
+        plan,
+        apple_calendar_name="Life",
+        db=db,
+        max_receipts=1,
+    )
+
+    assert result.deleted_receipts == 1
+    assert result.skipped == 1
+    assert db.deleted == [("sync-1", "page-missing", "apple-missing", "Life")]
+    assert db.missing_apple == []
+    assert db.missing_notion == []
+    assert db.cleared == []
+
+
+@pytest.mark.asyncio
+async def test_execute_production_receipt_cleanup_plan_refuses_over_cap():
+    first = {
+        "apple_sync_id": "sync-1",
+        "notion_page_id": "page-missing-1",
+        "apple_reminder_id": "apple-missing-1",
+    }
+    second = {
+        "apple_sync_id": "sync-2",
+        "notion_page_id": "page-missing-2",
+        "apple_reminder_id": "apple-missing-2",
+    }
+    plan = build_deletion_grace_plan([], [], [first, second])
+
+    with pytest.raises(ValueError, match="cap is 1"):
+        await execute_production_receipt_cleanup_plan(
+            plan,
+            apple_calendar_name="Life",
+            db=FakeDeletionGraceDB(),
+            max_receipts=1,
         )
 
 

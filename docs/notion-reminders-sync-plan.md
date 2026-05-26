@@ -553,3 +553,4 @@ Production enablement is now implemented as an explicit, allowlisted pilot path:
 - Production baselines are explicit via `icloudbridge reminders notion-production-baseline`; they write snapshot baselines only for `NEEDS_BASELINE` rows and refuse while Apple-to-Notion creates are pending.
 - Production updates are refused while Apple-to-Notion creates are still pending for that list.
 - Missing-side production behavior remains detection-only: marker writes and marker clears are allowed, but cancellation/completion/hard deletion remains blocked.
+- Manual receipt cleanup is explicit via `icloudbridge reminders notion-production-cleanup-receipts`; it deletes only local receipts whose Notion and Apple sides are both absent, with exact expected counts and production confirmation.

@@ -246,6 +246,14 @@ class DeletionGraceExecutionResult:
 
 
 @dataclass
+class ReceiptCleanupExecutionResult:
+    """Stats from manually cleaning local mapping receipts."""
+
+    deleted_receipts: int = 0
+    skipped: int = 0
+
+
+@dataclass
 class ProofMutation:
     """Deterministic source-side mutation for a Milestone 5D proof run."""
 
@@ -1436,4 +1444,42 @@ async def execute_production_deletion_grace_plan(
             result.marked_missing_notion += 1
         else:
             result.skipped += 1
+    return result
+
+
+async def execute_production_receipt_cleanup_plan(
+    plan: DeletionGracePlan,
+    apple_calendar_name: str,
+    db: Any,
+    max_receipts: int,
+) -> ReceiptCleanupExecutionResult:
+    """Delete exact local receipts whose Notion and Apple sides are both absent."""
+    cleanup_actions = [
+        action
+        for action in plan.actions
+        if action.kind == "UNTRACKED" and action.reason == "both_sides_absent"
+    ]
+    if len(cleanup_actions) > max_receipts:
+        raise ValueError(
+            f"Refusing {len(cleanup_actions)} receipt cleanups; cap is {max_receipts}"
+        )
+
+    result = ReceiptCleanupExecutionResult(
+        skipped=len(plan.actions) - len(cleanup_actions)
+    )
+    for action in cleanup_actions:
+        if not action.apple_sync_id or not action.notion_page_id or not action.apple_reminder_id:
+            result.skipped += 1
+            continue
+
+        deleted = await db.delete_notion_reminder_mapping(
+            apple_sync_id=action.apple_sync_id,
+            notion_page_id=action.notion_page_id,
+            apple_reminder_id=action.apple_reminder_id,
+            apple_calendar_name=apple_calendar_name,
+        )
+        result.deleted_receipts += deleted
+        if not deleted:
+            result.skipped += 1
+
     return result
