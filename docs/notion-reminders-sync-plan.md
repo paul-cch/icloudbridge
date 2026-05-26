@@ -513,7 +513,7 @@ The strategy graduates from design to production only when all gates pass:
 - Gate F: closed for the test slice. Completion status converges both ways.
 - Gate G: mostly closed for the test slice. Timed, all-day, and cleared due dates converge both ways; broader DST boundary coverage remains future hardening.
 - Gate H: closed for the test slice. Lost Apple identifier simulation recovers one stale Notion receipt and repeated recovery is a no-op.
-- Gate I: open. Notion 429 retry handling is not tested yet.
+- Gate I: closed. Notion 429 retry handling is covered with deterministic mocked `Retry-After` tests; live API stress was intentionally not used.
 - Gate J: open. Deletion/cancellation grace policy is not tested yet.
 
 Until those pass, the app must default to dry-run or test-slice mode.
@@ -528,13 +528,16 @@ Until those pass, the app must default to dry-run or test-slice mode.
 - `7508382`: Add Notion reminders bidirectional update sync.
 - `634213f`: Add Notion reminders field proof command.
 - `214ec2a`: Add Notion reminders identity recovery.
+- `b7290f2`: Add Notion rate-limit retry handling.
 
 Milestone 5D live proof matrix was run against `Notion Sync Test` for all seven supported fields in both directions. The final live update plan reported `NOOP: 2` with all other action counts at `0`.
 
 Milestone 6 live proof was run against `Notion Sync Test`. The proof patched one `[SYNC TEST]` row to `MILESTONE-6-STALE-ID`, recovered the original Apple Reminder ID, recovered `1` row on the first apply, recovered `0` rows on the second apply, and finished with recovery counts `NOOP: 2`, `RECOVER_APPLE_ID: 0`, `UNRECOVERED: 0`; final update counts were `NOOP: 2` with all other action counts at `0`.
 
+Gate I proof used mocked Notion `429` responses with `httpx.MockTransport` to verify numeric, missing, invalid, and capped `Retry-After` handling, retry-budget exhaustion, and non-429 pass-through behavior. A normal live recovery dry-run against `Notion Sync Test` still reported `NOOP: 2`, `RECOVER_APPLE_ID: 0`, and `UNRECOVERED: 0`.
+
 ## Next Concrete Step
 
-Implement Gate I or Gate J, not production-list sync:
+Implement Gate J, not production-list sync:
 
-Add Notion 429 retry handling or deletion/cancellation grace policy proofs. Production-list sync remains blocked until both gates are explicitly closed.
+Add deletion/cancellation grace policy proofs. Production-list sync remains blocked until Gate J is explicitly closed.
