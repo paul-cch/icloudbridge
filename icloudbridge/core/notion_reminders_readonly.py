@@ -220,6 +220,14 @@ class UpdateNotionExecutionResult:
 
 
 @dataclass
+class BaselineExecutionResult:
+    """Stats from writing snapshot baselines for matched rows."""
+
+    baselined: int = 0
+    skipped_non_baseline: int = 0
+
+
+@dataclass
 class IdentityRecoveryExecutionResult:
     """Stats from applying stale Apple reminder ID repairs."""
 
@@ -970,6 +978,66 @@ async def execute_create_notion_plan(
     return result
 
 
+async def execute_production_create_notion_plan(
+    plan: ReadOnlySyncPlan,
+    data_source_id: str,
+    apple_calendar_name: str,
+    notion_area: str,
+    notion_adapter: Any,
+    db: Any,
+    max_creates: int,
+    sync_id_factory: Any | None = None,
+) -> CreateNotionExecutionResult:
+    """Execute capped CREATE_NOTION actions for an allowlisted production list."""
+    create_actions = [action for action in plan.actions if action.kind == "CREATE_NOTION"]
+    if len(create_actions) > max_creates:
+        raise ValueError(
+            f"Refusing {len(create_actions)} CREATE_NOTION actions; cap is {max_creates}"
+        )
+
+    result = CreateNotionExecutionResult(
+        skipped_non_create_notion=len(plan.actions) - len(create_actions)
+    )
+
+    for action in create_actions:
+        reminder = action.apple_reminder
+        if reminder is None:
+            continue
+
+        apple_sync_id = (
+            sync_id_factory() if sync_id_factory else f"apple-reminders:{uuid4()}"
+        )
+        created = await notion_adapter.create_apple_origin_task(
+            data_source_id=data_source_id,
+            title=getattr(reminder, "title", ""),
+            notes=getattr(reminder, "notes", None),
+            apple_sync_id=apple_sync_id,
+            apple_reminder_id=getattr(reminder, "uuid", ""),
+            completed=getattr(reminder, "completed", False),
+            due_date=getattr(reminder, "due_date", None),
+            due_is_all_day=getattr(reminder, "is_all_day", False),
+            area=notion_area,
+        )
+
+        try:
+            await db.upsert_notion_reminder_mapping(
+                apple_sync_id=page_apple_sync_id(created) or apple_sync_id,
+                notion_page_id=created["id"],
+                apple_reminder_id=getattr(reminder, "uuid", ""),
+                apple_calendar_name=apple_calendar_name,
+                timestamp=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            raise CreateNotionPartialFailure(
+                "Notion row was created, but SQLite identity persistence failed. "
+                "Rerun the production plan before applying again."
+            ) from exc
+
+        result.created_notion += 1
+
+    return result
+
+
 async def execute_update_apple_plan(
     plan: BidirectionalUpdatePlan,
     apple_calendar_name: str,
@@ -984,6 +1052,52 @@ async def execute_update_apple_plan(
     update_actions = [action for action in plan.actions if action.kind == "UPDATE_APPLE"]
     if len(update_actions) > 1 and not allow_multiple_test_updates:
         raise ValueError("Refusing multiple UPDATE_APPLE actions without explicit opt-in")
+
+    result = UpdateAppleExecutionResult(
+        skipped_non_update_apple=len(plan.actions) - len(update_actions)
+    )
+
+    for action in update_actions:
+        task = action.notion_task
+        reminder = action.apple_reminder
+        if task is None or reminder is None:
+            continue
+
+        updated = await reminders_adapter.update_reminder(
+            uuid=getattr(reminder, "uuid", ""),
+            title=task.title,
+            notes=task.notes if task.notes is not None else "",
+            completed=task.completed,
+            priority=map_notion_priority_to_apple(task.priority),
+            due_date=task.due_date,
+            is_all_day=task.due_is_all_day,
+            clear_due_date=task.due_date is None,
+        )
+        await db.update_notion_reminder_snapshots(
+            apple_sync_id=task.apple_sync_id
+            or (action.mapping or {}).get("apple_sync_id")
+            or task.page_id,
+            notion_snapshot=build_notion_snapshot(task),
+            apple_snapshot=build_apple_snapshot(updated),
+            timestamp=datetime.now(timezone.utc),
+        )
+        result.updated_apple += 1
+
+    return result
+
+
+async def execute_production_update_apple_plan(
+    plan: BidirectionalUpdatePlan,
+    reminders_adapter: Any,
+    db: Any,
+    max_updates: int,
+) -> UpdateAppleExecutionResult:
+    """Execute capped UPDATE_APPLE actions for an allowlisted production list."""
+    update_actions = [action for action in plan.actions if action.kind == "UPDATE_APPLE"]
+    if len(update_actions) > max_updates:
+        raise ValueError(
+            f"Refusing {len(update_actions)} UPDATE_APPLE actions; cap is {max_updates}"
+        )
 
     result = UpdateAppleExecutionResult(
         skipped_non_update_apple=len(plan.actions) - len(update_actions)
@@ -1067,6 +1181,85 @@ async def execute_update_notion_plan(
     return result
 
 
+async def execute_production_update_notion_plan(
+    plan: BidirectionalUpdatePlan,
+    notion_adapter: Any,
+    db: Any,
+    max_updates: int,
+) -> UpdateNotionExecutionResult:
+    """Execute capped UPDATE_NOTION actions for an allowlisted production list."""
+    update_actions = [action for action in plan.actions if action.kind == "UPDATE_NOTION"]
+    if len(update_actions) > max_updates:
+        raise ValueError(
+            f"Refusing {len(update_actions)} UPDATE_NOTION actions; cap is {max_updates}"
+        )
+
+    result = UpdateNotionExecutionResult(
+        skipped_non_update_notion=len(plan.actions) - len(update_actions)
+    )
+
+    for action in update_actions:
+        task = action.notion_task
+        reminder = action.apple_reminder
+        if task is None or reminder is None:
+            continue
+
+        updated_page = await notion_adapter.update_task_from_apple(
+            page_id=task.page_id,
+            title=getattr(reminder, "title", ""),
+            notes=getattr(reminder, "notes", None),
+            completed=getattr(reminder, "completed", False),
+            notion_priority=map_apple_priority_to_notion(getattr(reminder, "priority", 0)),
+            due_date=getattr(reminder, "due_date", None),
+            due_is_all_day=getattr(reminder, "is_all_day", False),
+        )
+        updated_task = parse_notion_task(updated_page)
+        await db.update_notion_reminder_snapshots(
+            apple_sync_id=updated_task.apple_sync_id
+            or task.apple_sync_id
+            or (action.mapping or {}).get("apple_sync_id")
+            or task.page_id,
+            notion_snapshot=build_notion_snapshot(updated_task),
+            apple_snapshot=build_apple_snapshot(reminder),
+            timestamp=datetime.now(timezone.utc),
+        )
+        result.updated_notion += 1
+
+    return result
+
+
+async def execute_production_baseline_plan(
+    plan: BidirectionalUpdatePlan,
+    db: Any,
+) -> BaselineExecutionResult:
+    """Write snapshot baselines for NEEDS_BASELINE production actions only."""
+    baseline_actions = [
+        action for action in plan.actions if action.kind == "NEEDS_BASELINE"
+    ]
+    result = BaselineExecutionResult(
+        skipped_non_baseline=len(plan.actions) - len(baseline_actions)
+    )
+
+    timestamp = datetime.now(timezone.utc)
+    for action in baseline_actions:
+        task = action.notion_task
+        reminder = action.apple_reminder
+        if task is None or reminder is None:
+            continue
+
+        await db.update_notion_reminder_snapshots(
+            apple_sync_id=task.apple_sync_id
+            or (action.mapping or {}).get("apple_sync_id")
+            or task.page_id,
+            notion_snapshot=build_notion_snapshot(task),
+            apple_snapshot=build_apple_snapshot(reminder),
+            timestamp=timestamp,
+        )
+        result.baselined += 1
+
+    return result
+
+
 async def execute_identity_recovery_plan(
     plan: IdentityRecoveryPlan,
     apple_calendar_name: str,
@@ -1116,6 +1309,52 @@ async def execute_identity_recovery_plan(
     return result
 
 
+async def execute_production_identity_recovery_plan(
+    plan: IdentityRecoveryPlan,
+    apple_calendar_name: str,
+    notion_adapter: Any,
+    db: Any,
+    max_recoveries: int,
+) -> IdentityRecoveryExecutionResult:
+    """Apply capped Apple reminder ID receipt recovery for production mappings."""
+    recovery_actions = [
+        action for action in plan.actions if action.kind == "RECOVER_APPLE_ID"
+    ]
+    if len(recovery_actions) > max_recoveries:
+        raise ValueError(
+            f"Refusing {len(recovery_actions)} identity recoveries; cap is {max_recoveries}"
+        )
+
+    result = IdentityRecoveryExecutionResult(
+        skipped_non_recovery=len(plan.actions) - len(recovery_actions)
+    )
+    for action in recovery_actions:
+        if action.notion_task is None or action.apple_reminder is None:
+            continue
+        if not action.new_apple_reminder_id:
+            continue
+
+        timestamp = datetime.now(timezone.utc)
+        await notion_adapter.update_page_apple_reminder_id(
+            action.notion_page_id,
+            action.new_apple_reminder_id,
+        )
+        await db.replace_notion_mapping_apple_reminder_id(
+            apple_sync_id=action.apple_sync_id,
+            apple_reminder_id=action.new_apple_reminder_id,
+            apple_calendar_name=apple_calendar_name,
+            timestamp=timestamp,
+        )
+        await db.update_notion_reminder_snapshots(
+            apple_sync_id=action.apple_sync_id,
+            notion_snapshot=build_notion_snapshot(action.notion_task),
+            apple_snapshot=build_apple_snapshot(action.apple_reminder),
+            timestamp=timestamp,
+        )
+        result.recovered += 1
+    return result
+
+
 async def execute_deletion_grace_plan(
     plan: DeletionGracePlan,
     apple_calendar_name: str,
@@ -1125,6 +1364,46 @@ async def execute_deletion_grace_plan(
     if apple_calendar_name != "Notion Sync Test":
         raise ValueError("Gate J deletion grace recording is limited to 'Notion Sync Test'")
 
+    result = DeletionGraceExecutionResult()
+    timestamp = datetime.now(timezone.utc)
+    for action in plan.actions:
+        if not action.apple_sync_id:
+            result.skipped += 1
+            continue
+
+        if action.kind == "NOOP":
+            marker_present = bool(
+                (action.mapping or {}).get("missing_apple_seen_at")
+                or (action.mapping or {}).get("missing_notion_seen_at")
+            )
+            if marker_present:
+                await db.clear_notion_reminder_missing_markers(
+                    apple_sync_id=action.apple_sync_id,
+                    timestamp=timestamp,
+                )
+                result.cleared_markers += 1
+        elif action.kind == "MISSING_APPLE_FIRST_SEEN":
+            await db.mark_notion_reminder_missing_apple(
+                apple_sync_id=action.apple_sync_id,
+                timestamp=timestamp,
+            )
+            result.marked_missing_apple += 1
+        elif action.kind == "MISSING_NOTION_FIRST_SEEN":
+            await db.mark_notion_reminder_missing_notion(
+                apple_sync_id=action.apple_sync_id,
+                timestamp=timestamp,
+            )
+            result.marked_missing_notion += 1
+        else:
+            result.skipped += 1
+    return result
+
+
+async def execute_production_deletion_grace_plan(
+    plan: DeletionGracePlan,
+    db: Any,
+) -> DeletionGraceExecutionResult:
+    """Record detection-only missing-side markers for production mappings."""
     result = DeletionGraceExecutionResult()
     timestamp = datetime.now(timezone.utc)
     for action in plan.actions:

@@ -539,8 +539,17 @@ Gate I proof used mocked Notion `429` responses with `httpx.MockTransport` to ve
 
 Gate J proof was run against `Notion Sync Test` without deleting or mutating live Notion rows or Apple reminders. The live plan reported `NOOP: 2` with all missing counts at `0`; simulated first and second missing runs produced the expected `MISSING_APPLE_*` and `MISSING_NOTION_*` buckets; resolved rows returned to `NOOP: 2`; proof-only marker writes recorded one missing-Apple marker, one missing-Notion marker, and one clear.
 
+Production pilot proof was run against the allowlisted `Life` mapping with one temporary row. The preflight plan started at create/update/recovery/missing counts of `0`; production create wrote `1` Notion row; production baseline wrote `1` snapshot baseline; Apple-to-Notion title/notes update wrote `1`; Notion-to-Apple title/notes update wrote `1`; both follow-up update directions wrote `0`; manual cleanup removed the temporary row and local receipt; final production plan returned to create/update/recovery/missing counts of `0`.
+
 ## Next Concrete Step
 
-Production enablement is the next separate decision, not an automatic follow-on:
+Production enablement is now implemented as an explicit, allowlisted pilot path:
 
-Before syncing a real list, add an explicit production enablement plan that defines allowed list names, dry-run defaults, apply gates, operator receipts, and rollback/no-op checks. Apply-side cancellation/completion remains future work and is not implemented by Gate J.
+- Allowed Apple list to Notion Area mappings live in app config as `reminders.notion_area_mappings`.
+- Initial mappings: `Life -> Life`, `Dissertation -> Dissertation`, and `Academic -> Academic`.
+- Production commands are separate from the `Notion Sync Test` milestone commands and do not weaken the test-slice guards.
+- Production applies require exact allowlisted list names, explicit `--apply`, explicit `--confirm-production`, expected action counts, and capped writes.
+- First production create cap defaults to 5 Apple-to-Notion rows.
+- Production baselines are explicit via `icloudbridge reminders notion-production-baseline`; they write snapshot baselines only for `NEEDS_BASELINE` rows and refuse while Apple-to-Notion creates are pending.
+- Production updates are refused while Apple-to-Notion creates are still pending for that list.
+- Missing-side production behavior remains detection-only: marker writes and marker clears are allowed, but cancellation/completion/hard deletion remains blocked.

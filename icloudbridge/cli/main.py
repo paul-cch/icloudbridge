@@ -1,8 +1,8 @@
 """Command-line interface for iCloudBridge."""
 
 import asyncio
-import sys
 import logging
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -15,11 +15,6 @@ from rich.table import Table
 
 from icloudbridge import __version__
 from icloudbridge.core.config import load_config
-from icloudbridge.core.photos_export_engine import ExportConfig, PhotoExportEngine
-from icloudbridge.core.photos_sync import PhotoSyncEngine
-from icloudbridge.core.reminders_sync import RemindersSyncEngine
-from icloudbridge.core.rich_notes_export import RichNotesExporter
-from icloudbridge.core.sync import NotesSyncEngine
 from icloudbridge.core.notion_reminders_readonly import (
     CreateApplePartialFailure,
     CreateNotionPartialFailure,
@@ -37,9 +32,20 @@ from icloudbridge.core.notion_reminders_readonly import (
     execute_create_notion_plan,
     execute_deletion_grace_plan,
     execute_identity_recovery_plan,
+    execute_production_baseline_plan,
+    execute_production_create_notion_plan,
+    execute_production_deletion_grace_plan,
+    execute_production_identity_recovery_plan,
+    execute_production_update_apple_plan,
+    execute_production_update_notion_plan,
     execute_update_apple_plan,
     execute_update_notion_plan,
 )
+from icloudbridge.core.photos_export_engine import ExportConfig, PhotoExportEngine
+from icloudbridge.core.photos_sync import PhotoSyncEngine
+from icloudbridge.core.reminders_sync import RemindersSyncEngine
+from icloudbridge.core.rich_notes_export import RichNotesExporter
+from icloudbridge.core.sync import NotesSyncEngine
 from icloudbridge.sources.reminders.notion_adapter import (
     DEFAULT_NOTION_API_VERSION,
     DEFAULT_TASKS_DATA_SOURCE_ID,
@@ -49,10 +55,10 @@ from icloudbridge.sources.reminders.notion_adapter import (
     NotionSchemaReport,
     NotionTasksAdapter,
     PropertyCheck,
+    load_notion_token,
     page_apple_sync_id,
     page_notes,
     page_title,
-    load_notion_token,
 )
 from icloudbridge.utils.logging import setup_logging
 from icloudbridge.utils.photos_db import PhotosDB
@@ -2121,6 +2127,70 @@ def _print_deletion_grace_plan(title: str, plan) -> None:
     console.print(table)
 
 
+def _print_create_plan(title: str, sync_plan) -> None:
+    summary = Table(title=title)
+    summary.add_column("Action", style="cyan")
+    summary.add_column("Count", style="green", justify="right")
+    for kind in ("NOOP", "CREATE_APPLE", "CREATE_NOTION"):
+        summary.add_row(kind, str(sync_plan.counts[kind]))
+    console.print(summary)
+
+    actions_table = Table(title="Planned Create Actions")
+    actions_table.add_column("Action", style="cyan")
+    actions_table.add_column("Direction")
+    actions_table.add_column("Title")
+    actions_table.add_column("Status/Completed")
+    actions_table.add_column("Due")
+    actions_table.add_column("Source ID")
+    for action in sync_plan.actions:
+        actions_table.add_row(
+            action.kind,
+            action.direction,
+            action.title,
+            action.status,
+            _date_label(action.due_date),
+            action.source_id,
+        )
+    console.print(actions_table)
+
+
+def _production_notion_area(config, apple_calendar: str) -> str | None:
+    area_mappings = config.reminders.notion_area_mappings
+    notion_area = area_mappings.get(apple_calendar)
+    if notion_area:
+        return notion_area
+
+    table = Table(title="Allowed Production Notion Area Mappings")
+    table.add_column("Apple Reminders List", style="cyan")
+    table.add_column("Notion Area", style="green")
+    for list_name, area_name in area_mappings.items():
+        table.add_row(list_name, area_name)
+    console.print(table)
+    console.print(
+        f"[red]Refusing production run:[/red] {apple_calendar!r} is not allowlisted."
+    )
+    return None
+
+
+def _confirm_production(apply: bool, confirm_production: bool) -> bool:
+    if apply and not confirm_production:
+        console.print(
+            "[red]Refusing production apply:[/red] pass --confirm-production as an "
+            "explicit second gate."
+        )
+        return False
+    return True
+
+
+def _expected_count_matches(kind: str, actual: int, expected: int) -> bool:
+    if actual != expected:
+        console.print(
+            f"[red]Refusing apply:[/red] expected {expected} {kind}, planned {actual}."
+        )
+        return False
+    return True
+
+
 async def _read_notion_update_plan(
     data_source_id: str,
     apple_calendar: str,
@@ -2243,6 +2313,609 @@ async def _read_notion_deletion_grace_plan(
     mappings = await db.get_all_notion_reminder_mappings()
     grace_plan = build_deletion_grace_plan(notion_tasks, apple_reminders, mappings)
     return grace_plan, notion, reminders, db, notion_tasks, apple_reminders, mappings
+
+
+async def _read_notion_production_plans(
+    data_source_id: str,
+    apple_calendar: str,
+    notion_token: str | None,
+    api_version: str,
+    notion_page_size: int,
+    db_path: Path,
+    config,
+):
+    from icloudbridge.sources.reminders.eventkit import RemindersAdapter
+    from icloudbridge.utils.db import NotionRemindersDB
+
+    notion_area = _production_notion_area(config, apple_calendar)
+    if not notion_area:
+        return None
+
+    token = load_notion_token(notion_token)
+    notion = NotionTasksAdapter(token=token, api_version=api_version)
+    report = await notion.preflight_schema(data_source_id)
+    if not report.ok:
+        _print_notion_schema_report(report)
+        return None
+    if notion_area not in report.area_options:
+        console.print(
+            f"[red]Refusing production run:[/red] Notion Area {notion_area!r} "
+            "does not exist in the Tasks data source."
+        )
+        return None
+
+    notion_tasks = await notion.query_tasks_with_apple_sync_id(
+        data_source_id=data_source_id,
+        page_size=notion_page_size,
+    )
+    reminders = RemindersAdapter()
+    if not await reminders.request_access():
+        console.print("[red]Apple Reminders access was not granted.[/red]")
+        return None
+
+    calendars = await reminders.list_calendars()
+    target_calendar = next((cal for cal in calendars if cal.title == apple_calendar), None)
+    if not target_calendar:
+        console.print(f"[red]Apple Reminders list not found:[/red] {apple_calendar!r}")
+        return None
+
+    apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+    apple_ids = {getattr(reminder, "uuid", "") for reminder in apple_reminders}
+    db = NotionRemindersDB(db_path)
+    await db.initialize()
+    mappings = await db.get_all_notion_reminder_mappings()
+    scoped_mappings = [
+        mapping
+        for mapping in mappings
+        if mapping.get("apple_calendar_name") == apple_calendar
+    ]
+    scoped_sync_ids = {
+        mapping.get("apple_sync_id") for mapping in scoped_mappings if mapping.get("apple_sync_id")
+    }
+    scoped_notion_tasks = [
+        task
+        for task in notion_tasks
+        if task.apple_sync_id in scoped_sync_ids or task.apple_reminder_id in apple_ids
+    ]
+
+    match_report = build_readonly_match_report(scoped_notion_tasks, apple_reminders)
+    create_plan = build_readonly_sync_plan(match_report)
+    update_plan = build_bidirectional_update_plan(match_report, scoped_mappings)
+    recovery_plan = build_identity_recovery_plan(
+        scoped_notion_tasks,
+        apple_reminders,
+        scoped_mappings,
+    )
+    grace_plan = build_deletion_grace_plan(
+        scoped_notion_tasks,
+        apple_reminders,
+        scoped_mappings,
+    )
+    return {
+        "area": notion_area,
+        "target_calendar": target_calendar,
+        "notion": notion,
+        "reminders": reminders,
+        "db": db,
+        "create_plan": create_plan,
+        "update_plan": update_plan,
+        "recovery_plan": recovery_plan,
+        "grace_plan": grace_plan,
+    }
+
+
+@reminders_app.command("notion-production-plan")
+def reminders_notion_production_plan(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(..., "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+) -> None:
+    """Plan allowlisted production Notion Tasks ↔ Apple Reminders actions."""
+
+    async def run_production_plan() -> bool:
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+        except Exception as exc:
+            console.print(f"[red]Production planning failed:[/red] {exc}")
+            return False
+        if context is None:
+            return False
+
+        console.print(
+            f"[green]Production list:[/green] {apple_calendar}  "
+            f"[green]Notion Area:[/green] {context['area']}"
+        )
+        _print_create_plan("Production Create Plan", context["create_plan"])
+        _print_update_plan("Production Update Plan", context["update_plan"])
+        _print_identity_recovery_plan(
+            "Production Identity Recovery Plan",
+            context["recovery_plan"],
+        )
+        _print_deletion_grace_plan(
+            "Production Missing-Side Detection Plan",
+            context["grace_plan"],
+        )
+        console.print("\n[green]No writes attempted.[/green]")
+        return True
+
+    passed = asyncio.run(run_production_plan())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-create-notion")
+def reminders_notion_production_create_notion(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(..., "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    expected_creates: int = typer.Option(..., "--expected-creates", min=0),
+    max_creates: Optional[int] = typer.Option(None, "--max-creates", min=0),
+    apply: bool = typer.Option(False, "--apply", help="Actually create Notion rows"),
+    confirm_production: bool = typer.Option(
+        False,
+        "--confirm-production",
+        help="Required second gate for production writes",
+    ),
+) -> None:
+    """Create Notion rows from an allowlisted production Apple list."""
+
+    async def run_create() -> bool:
+        if not _confirm_production(apply, confirm_production):
+            return False
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+            if context is None:
+                return False
+            create_plan = context["create_plan"]
+            _print_create_plan("Production Create Plan", create_plan)
+            actual = create_plan.counts["CREATE_NOTION"]
+            if not _expected_count_matches("CREATE_NOTION actions", actual, expected_creates):
+                return False
+            if not apply:
+                console.print("\n[yellow]Dry run only.[/yellow] Pass --apply to create rows.")
+                return True
+
+            result = await execute_production_create_notion_plan(
+                create_plan,
+                data_source_id=data_source_id,
+                apple_calendar_name=apple_calendar,
+                notion_area=context["area"],
+                notion_adapter=context["notion"],
+                db=context["db"],
+                max_creates=max_creates
+                if max_creates is not None
+                else ctx.obj["config"].reminders.notion_production_create_limit,
+            )
+            result_table = Table(title="Production Create Apply Result")
+            result_table.add_column("Metric", style="cyan")
+            result_table.add_column("Count", style="green", justify="right")
+            result_table.add_row("Created Notion rows", str(result.created_notion))
+            result_table.add_row(
+                "Skipped non-CREATE_NOTION actions",
+                str(result.skipped_non_create_notion),
+            )
+            console.print(result_table)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Production create failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_create())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-baseline")
+def reminders_notion_production_baseline(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(..., "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    expected_baselines: int = typer.Option(..., "--expected-baselines", min=0),
+    apply: bool = typer.Option(False, "--apply", help="Actually write snapshot baselines"),
+    confirm_production: bool = typer.Option(False, "--confirm-production"),
+) -> None:
+    """Write snapshot baselines for an allowlisted production Apple list."""
+
+    async def run_baseline() -> bool:
+        if not apply:
+            console.print(
+                "[red]Refusing baseline write:[/red] pass --apply after reviewing "
+                "the production plan."
+            )
+            return False
+        if not _confirm_production(apply, confirm_production):
+            return False
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+            if context is None:
+                return False
+            if context["create_plan"].counts["CREATE_NOTION"]:
+                console.print(
+                    "[red]Refusing baseline:[/red] production creates are still pending."
+                )
+                return False
+            update_plan = context["update_plan"]
+            _print_update_plan("Production Baseline Plan", update_plan)
+            actual = update_plan.counts["NEEDS_BASELINE"]
+            if not _expected_count_matches(
+                "NEEDS_BASELINE actions",
+                actual,
+                expected_baselines,
+            ):
+                return False
+            result = await execute_production_baseline_plan(
+                update_plan,
+                db=context["db"],
+            )
+            table = Table(title="Production Baseline Apply Result")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Count", style="green", justify="right")
+            table.add_row("Snapshot baselines written", str(result.baselined))
+            table.add_row(
+                "Skipped non-NEEDS_BASELINE actions",
+                str(result.skipped_non_baseline),
+            )
+            console.print(table)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Production baseline failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_baseline())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-update-apple")
+def reminders_notion_production_update_apple(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(..., "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    expected_updates: int = typer.Option(..., "--expected-updates", min=0),
+    max_updates: Optional[int] = typer.Option(None, "--max-updates", min=0),
+    apply: bool = typer.Option(False, "--apply", help="Actually update Apple reminders"),
+    confirm_production: bool = typer.Option(False, "--confirm-production"),
+) -> None:
+    """Apply Notion-to-Apple updates for an allowlisted production list."""
+
+    async def run_update() -> bool:
+        if not _confirm_production(apply, confirm_production):
+            return False
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+            if context is None:
+                return False
+            if context["create_plan"].counts["CREATE_NOTION"]:
+                console.print(
+                    "[red]Refusing update:[/red] production creates are still pending."
+                )
+                return False
+            update_plan = context["update_plan"]
+            _print_update_plan("Production Notion → Apple Update Plan", update_plan)
+            actual = update_plan.counts["UPDATE_APPLE"]
+            if not _expected_count_matches("UPDATE_APPLE actions", actual, expected_updates):
+                return False
+            if not apply:
+                console.print("\n[yellow]Dry run only.[/yellow] Pass --apply to update Apple.")
+                return True
+            result = await execute_production_update_apple_plan(
+                update_plan,
+                reminders_adapter=context["reminders"],
+                db=context["db"],
+                max_updates=max_updates
+                if max_updates is not None
+                else ctx.obj["config"].reminders.notion_production_update_limit,
+            )
+            table = Table(title="Production Update Apple Apply Result")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Count", style="green", justify="right")
+            table.add_row("Updated Apple reminders", str(result.updated_apple))
+            table.add_row("Skipped non-UPDATE_APPLE actions", str(result.skipped_non_update_apple))
+            console.print(table)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Production Apple update failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_update())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-update-notion")
+def reminders_notion_production_update_notion(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(..., "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    expected_updates: int = typer.Option(..., "--expected-updates", min=0),
+    max_updates: Optional[int] = typer.Option(None, "--max-updates", min=0),
+    apply: bool = typer.Option(False, "--apply", help="Actually update Notion rows"),
+    confirm_production: bool = typer.Option(False, "--confirm-production"),
+) -> None:
+    """Apply Apple-to-Notion updates for an allowlisted production list."""
+
+    async def run_update() -> bool:
+        if not _confirm_production(apply, confirm_production):
+            return False
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+            if context is None:
+                return False
+            if context["create_plan"].counts["CREATE_NOTION"]:
+                console.print(
+                    "[red]Refusing update:[/red] production creates are still pending."
+                )
+                return False
+            update_plan = context["update_plan"]
+            _print_update_plan("Production Apple → Notion Update Plan", update_plan)
+            actual = update_plan.counts["UPDATE_NOTION"]
+            if not _expected_count_matches("UPDATE_NOTION actions", actual, expected_updates):
+                return False
+            if not apply:
+                console.print("\n[yellow]Dry run only.[/yellow] Pass --apply to update Notion.")
+                return True
+            result = await execute_production_update_notion_plan(
+                update_plan,
+                notion_adapter=context["notion"],
+                db=context["db"],
+                max_updates=max_updates
+                if max_updates is not None
+                else ctx.obj["config"].reminders.notion_production_update_limit,
+            )
+            table = Table(title="Production Update Notion Apply Result")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Count", style="green", justify="right")
+            table.add_row("Updated Notion rows", str(result.updated_notion))
+            table.add_row(
+                "Skipped non-UPDATE_NOTION actions",
+                str(result.skipped_non_update_notion),
+            )
+            console.print(table)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Production Notion update failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_update())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-recover-identity")
+def reminders_notion_production_recover_identity(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(..., "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    expected_recoveries: int = typer.Option(..., "--expected-recoveries", min=0),
+    max_recoveries: Optional[int] = typer.Option(None, "--max-recoveries", min=0),
+    apply: bool = typer.Option(False, "--apply", help="Actually repair stale Apple IDs"),
+    confirm_production: bool = typer.Option(False, "--confirm-production"),
+) -> None:
+    """Repair stale Apple Reminder ID receipts for an allowlisted production list."""
+
+    async def run_recovery() -> bool:
+        if not _confirm_production(apply, confirm_production):
+            return False
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+            if context is None:
+                return False
+            if context["create_plan"].counts["CREATE_NOTION"]:
+                console.print(
+                    "[red]Refusing recovery:[/red] production creates are still pending."
+                )
+                return False
+            recovery_plan = context["recovery_plan"]
+            _print_identity_recovery_plan("Production Identity Recovery Plan", recovery_plan)
+            actual = recovery_plan.counts["RECOVER_APPLE_ID"]
+            if not _expected_count_matches(
+                "RECOVER_APPLE_ID actions",
+                actual,
+                expected_recoveries,
+            ):
+                return False
+            if not apply:
+                console.print("\n[yellow]Dry run only.[/yellow] Pass --apply to recover IDs.")
+                return True
+            result = await execute_production_identity_recovery_plan(
+                recovery_plan,
+                apple_calendar_name=apple_calendar,
+                notion_adapter=context["notion"],
+                db=context["db"],
+                max_recoveries=max_recoveries
+                if max_recoveries is not None
+                else ctx.obj["config"].reminders.notion_production_recovery_limit,
+            )
+            table = Table(title="Production Identity Recovery Apply Result")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Count", style="green", justify="right")
+            table.add_row("Recovered Apple IDs", str(result.recovered))
+            table.add_row("Skipped non-recovery actions", str(result.skipped_non_recovery))
+            console.print(table)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Production recovery failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_recovery())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-deletion-grace-record")
+def reminders_notion_production_deletion_grace_record(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(..., "--apple-calendar", "-a"),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    expected_marker_writes: int = typer.Option(..., "--expected-marker-writes", min=0),
+    apply: bool = typer.Option(False, "--apply", help="Actually record missing markers"),
+    confirm_production: bool = typer.Option(False, "--confirm-production"),
+) -> None:
+    """Record production missing-side markers without cancelling/completing tasks."""
+
+    async def run_grace() -> bool:
+        if not _confirm_production(apply, confirm_production):
+            return False
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+            if context is None:
+                return False
+            if context["create_plan"].counts["CREATE_NOTION"]:
+                console.print(
+                    "[red]Refusing marker write:[/red] production creates are still pending."
+                )
+                return False
+            grace_plan = context["grace_plan"]
+            _print_deletion_grace_plan("Production Missing-Side Detection Plan", grace_plan)
+            planned_writes = (
+                grace_plan.counts["MISSING_APPLE_FIRST_SEEN"]
+                + grace_plan.counts["MISSING_NOTION_FIRST_SEEN"]
+                + sum(
+                    1
+                    for action in grace_plan.actions
+                    if action.kind == "NOOP"
+                    and (
+                        (action.mapping or {}).get("missing_apple_seen_at")
+                        or (action.mapping or {}).get("missing_notion_seen_at")
+                    )
+                )
+            )
+            if not _expected_count_matches(
+                "marker writes",
+                planned_writes,
+                expected_marker_writes,
+            ):
+                return False
+            if not apply:
+                console.print(
+                    "\n[yellow]Dry run only.[/yellow] Pass --apply to record markers."
+                )
+                return True
+            result = await execute_production_deletion_grace_plan(
+                grace_plan,
+                db=context["db"],
+            )
+            table = Table(title="Production Missing-Side Marker Apply Result")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Count", style="green", justify="right")
+            table.add_row("Marked missing Apple", str(result.marked_missing_apple))
+            table.add_row("Marked missing Notion", str(result.marked_missing_notion))
+            table.add_row("Cleared markers", str(result.cleared_markers))
+            table.add_row("Skipped", str(result.skipped))
+            console.print(table)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Production marker recording failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_grace())
+    if not passed:
+        raise typer.Exit(1)
 
 
 @reminders_app.command("notion-recovery-plan")

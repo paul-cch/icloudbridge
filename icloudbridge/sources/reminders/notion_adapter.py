@@ -13,7 +13,6 @@ from typing import Any
 
 import httpx
 
-
 DEFAULT_NOTION_API_VERSION = "2025-09-03"
 DEFAULT_TASKS_DATA_SOURCE_ID = "61ef2269-1dc6-4391-aaff-8013d2b857e3"
 DISPOSABLE_NOTION_TO_APPLE_TITLE = "[SYNC TEST] Notion to Apple"
@@ -220,6 +219,7 @@ def build_apple_origin_task_properties(
     completed: bool,
     due_date: datetime | None,
     due_is_all_day: bool,
+    area: str = "Life",
 ) -> dict[str, Any]:
     """Build Notion properties for an Apple-originated reminder test row."""
     properties = {
@@ -227,7 +227,7 @@ def build_apple_origin_task_properties(
         "Apple Sync ID": _rich_text(apple_sync_id),
         "Apple Reminder ID": _rich_text(apple_reminder_id),
         "Source": {"select": {"name": "Manual"}},
-        "Area": {"select": {"name": "Life"}},
+        "Area": {"select": {"name": area}},
         "Status": {"status": {"name": "Done" if completed else "Not started"}},
     }
     if notes:
@@ -555,6 +555,7 @@ class NotionTasksAdapter:
         completed: bool,
         due_date: datetime | None,
         due_is_all_day: bool,
+        area: str = "Life",
     ) -> dict[str, Any]:
         """Create a Notion Tasks row from an Apple reminder."""
         async with self._client() as client:
@@ -575,6 +576,7 @@ class NotionTasksAdapter:
                         completed=completed,
                         due_date=due_date,
                         due_is_all_day=due_is_all_day,
+                        area=area,
                     ),
                 },
             )

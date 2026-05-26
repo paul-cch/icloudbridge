@@ -13,14 +13,16 @@ from icloudbridge.core.notion_reminders_readonly import (
     build_identity_recovery_plan,
     build_notion_snapshot,
     build_proof_mutation,
+    build_readonly_match_report,
+    build_readonly_sync_plan,
     execute_create_apple_plan,
     execute_create_notion_plan,
     execute_deletion_grace_plan,
     execute_identity_recovery_plan,
+    execute_production_baseline_plan,
+    execute_production_create_notion_plan,
     execute_update_apple_plan,
     execute_update_notion_plan,
-    build_readonly_match_report,
-    build_readonly_sync_plan,
     map_apple_priority_to_notion,
     map_notion_priority_to_apple,
     snapshot_hash,
@@ -988,6 +990,96 @@ async def test_execute_create_notion_plan_refuses_multiple_creates_by_default():
             notion_adapter=FakeNotionAdapter(),
             db=FakeNotionRemindersDB(),
         )
+
+
+@pytest.mark.asyncio
+async def test_execute_production_create_notion_plan_uses_configured_area_and_cap():
+    plan = build_readonly_sync_plan(
+        build_readonly_match_report(
+            notion_tasks=[],
+            apple_reminders=[_apple_reminder("Academic task", "apple-1")],
+        )
+    )
+    notion = FakeNotionAdapter()
+    db = FakeNotionRemindersDB()
+
+    result = await execute_production_create_notion_plan(
+        plan,
+        data_source_id="data-source-id",
+        apple_calendar_name="Academic",
+        notion_area="Academic",
+        notion_adapter=notion,
+        db=db,
+        max_creates=5,
+        sync_id_factory=lambda: "apple-reminders:fixed",
+    )
+
+    assert result.created_notion == 1
+    assert notion.create_calls[0]["area"] == "Academic"
+    assert db.mappings[0]["apple_calendar_name"] == "Academic"
+
+
+@pytest.mark.asyncio
+async def test_execute_production_create_notion_plan_refuses_over_cap():
+    plan = build_readonly_sync_plan(
+        build_readonly_match_report(
+            notion_tasks=[],
+            apple_reminders=[
+                _apple_reminder("One", "apple-1"),
+                _apple_reminder("Two", "apple-2"),
+            ],
+        )
+    )
+
+    with pytest.raises(ValueError, match="cap is 1"):
+        await execute_production_create_notion_plan(
+            plan,
+            data_source_id="data-source-id",
+            apple_calendar_name="Academic",
+            notion_area="Academic",
+            notion_adapter=FakeNotionAdapter(),
+            db=FakeNotionRemindersDB(),
+            max_creates=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_production_baseline_plan_writes_needs_baseline_snapshots():
+    db = FakeNotionRemindersDB()
+    task = _notion_task("Life task", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("Life task", "apple-1", notes="Apple note")
+    noop_task = _notion_task("Stable", sync_id="sync-2", reminder_id="apple-2")
+    noop_apple = _apple_reminder("Stable", "apple-2")
+    plan = build_bidirectional_update_plan(
+        build_readonly_match_report([task, noop_task], [apple, noop_apple]),
+        [_mapping_for(noop_task, noop_apple)],
+    )
+
+    result = await execute_production_baseline_plan(plan, db=db)
+
+    assert result.baselined == 1
+    assert result.skipped_non_baseline == 1
+    assert len(db.snapshots) == 1
+    assert db.snapshots[0]["apple_sync_id"] == "sync-1"
+    assert db.snapshots[0]["notion_snapshot"] == build_notion_snapshot(task)
+    assert db.snapshots[0]["apple_snapshot"] == build_apple_snapshot(apple)
+
+
+@pytest.mark.asyncio
+async def test_execute_production_baseline_plan_ignores_non_baseline_actions():
+    db = FakeNotionRemindersDB()
+    task = _notion_task("Stable", sync_id="sync-1", reminder_id="apple-1")
+    apple = _apple_reminder("Stable", "apple-1")
+    plan = build_bidirectional_update_plan(
+        build_readonly_match_report([task], [apple]),
+        [_mapping_for(task, apple)],
+    )
+
+    result = await execute_production_baseline_plan(plan, db=db)
+
+    assert result.baselined == 0
+    assert result.skipped_non_baseline == 1
+    assert db.snapshots == []
 
 
 @pytest.mark.asyncio

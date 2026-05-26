@@ -7,15 +7,15 @@ from icloudbridge.sources.reminders.notion_adapter import (
     DISPOSABLE_APPLE_TO_NOTION_TITLE,
     DISPOSABLE_NOTION_TO_APPLE_TITLE,
     NotionTasksAdapter,
+    _find_token_in_json,
     build_apple_origin_task_properties,
     build_apple_reminder_id_patch,
+    build_apple_sync_id_query,
+    build_disposable_task_properties,
+    build_exact_title_query,
     build_task_proof_update_properties,
     build_task_update_from_apple_properties,
-    build_disposable_task_properties,
-    build_apple_sync_id_query,
-    build_exact_title_query,
     parse_notion_task,
-    _find_token_in_json,
 )
 
 
@@ -380,6 +380,21 @@ def test_build_apple_origin_task_properties_uses_safe_defaults_for_incomplete_re
     assert properties["Source"]["select"]["name"] == "Manual"
     assert properties["Area"]["select"]["name"] == "Life"
     assert "Due Date" not in properties
+
+
+def test_build_apple_origin_task_properties_accepts_configured_area():
+    properties = build_apple_origin_task_properties(
+        title="Academic task",
+        notes=None,
+        apple_sync_id="apple-reminders:uuid",
+        apple_reminder_id="apple-id",
+        completed=False,
+        due_date=None,
+        due_is_all_day=False,
+        area="Academic",
+    )
+
+    assert properties["Area"]["select"]["name"] == "Academic"
 
 
 def test_build_apple_origin_task_properties_maps_completed_and_due_date():

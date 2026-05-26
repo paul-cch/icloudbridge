@@ -148,6 +148,18 @@ class RemindersConfig(BaseSettings):
         default_factory=lambda: {"Reminders": "tasks"}
     )
 
+    # Notion production pilot mappings: Apple Reminders list → Notion Area.
+    notion_area_mappings: dict[str, str] = Field(
+        default_factory=lambda: {
+            "Life": "Life",
+            "Dissertation": "Dissertation",
+            "Academic": "Academic",
+        }
+    )
+    notion_production_create_limit: int = 5
+    notion_production_update_limit: int = 5
+    notion_production_recovery_limit: int = 1
+
     # Legacy fields for backward compatibility (deprecated)
     apple_calendar: str | None = None
     caldav_calendar: str | None = None
