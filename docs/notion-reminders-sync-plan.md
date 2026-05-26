@@ -2,9 +2,9 @@
 
 ## Confidence Statement
 
-Milestones 0 through 6 are implemented and proven against the live `Notion Sync Test` slice.
+Milestones 0 through 6, Gate I, and Gate J detection are implemented and proven against the live `Notion Sync Test` slice.
 
-The strategy is now high-confidence for the disposable test slice, including creates, bidirectional updates for title, notes, completion, priority, timed due dates, all-day due dates, due-date clearing, and stale Apple Reminder ID recovery. It is not yet production-ready for normal lists because Notion 429 retry behavior and deletion/cancellation grace policy remain open.
+The strategy is now high-confidence for the disposable test slice, including creates, bidirectional updates for title, notes, completion, priority, timed due dates, all-day due dates, due-date clearing, stale Apple Reminder ID recovery, Notion 429 retry handling, and two-run deletion/cancellation grace detection. It is not yet production-ready for normal lists because apply-side cancellation/completion and production enablement remain explicitly blocked.
 
 ## Goal
 
@@ -514,9 +514,9 @@ The strategy graduates from design to production only when all gates pass:
 - Gate G: mostly closed for the test slice. Timed, all-day, and cleared due dates converge both ways; broader DST boundary coverage remains future hardening.
 - Gate H: closed for the test slice. Lost Apple identifier simulation recovers one stale Notion receipt and repeated recovery is a no-op.
 - Gate I: closed. Notion 429 retry handling is covered with deterministic mocked `Retry-After` tests; live API stress was intentionally not used.
-- Gate J: open. Deletion/cancellation grace policy is not tested yet.
+- Gate J: closed for detection-only grace. Missing Apple and missing Notion states enter first-seen and still-missing buckets without deleting, cancelling, completing, or content-editing live tasks.
 
-Until those pass, the app must default to dry-run or test-slice mode.
+Until production enablement is explicit, the app must default to dry-run or test-slice mode.
 
 ## Implementation Receipts
 
@@ -529,6 +529,7 @@ Until those pass, the app must default to dry-run or test-slice mode.
 - `634213f`: Add Notion reminders field proof command.
 - `214ec2a`: Add Notion reminders identity recovery.
 - `b7290f2`: Add Notion rate-limit retry handling.
+- `2f61ca3`: Add Notion deletion grace detection.
 
 Milestone 5D live proof matrix was run against `Notion Sync Test` for all seven supported fields in both directions. The final live update plan reported `NOOP: 2` with all other action counts at `0`.
 
@@ -536,8 +537,10 @@ Milestone 6 live proof was run against `Notion Sync Test`. The proof patched one
 
 Gate I proof used mocked Notion `429` responses with `httpx.MockTransport` to verify numeric, missing, invalid, and capped `Retry-After` handling, retry-budget exhaustion, and non-429 pass-through behavior. A normal live recovery dry-run against `Notion Sync Test` still reported `NOOP: 2`, `RECOVER_APPLE_ID: 0`, and `UNRECOVERED: 0`.
 
+Gate J proof was run against `Notion Sync Test` without deleting or mutating live Notion rows or Apple reminders. The live plan reported `NOOP: 2` with all missing counts at `0`; simulated first and second missing runs produced the expected `MISSING_APPLE_*` and `MISSING_NOTION_*` buckets; resolved rows returned to `NOOP: 2`; proof-only marker writes recorded one missing-Apple marker, one missing-Notion marker, and one clear.
+
 ## Next Concrete Step
 
-Implement Gate J, not production-list sync:
+Production enablement is the next separate decision, not an automatic follow-on:
 
-Add deletion/cancellation grace policy proofs. Production-list sync remains blocked until Gate J is explicitly closed.
+Before syncing a real list, add an explicit production enablement plan that defines allowed list names, dry-run defaults, apply gates, operator receipts, and rollback/no-op checks. Apply-side cancellation/completion remains future work and is not implemented by Gate J.
