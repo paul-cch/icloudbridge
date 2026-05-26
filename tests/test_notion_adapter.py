@@ -1,3 +1,4 @@
+import httpx
 import pytest
 
 from icloudbridge.sources.reminders.notion_adapter import (
@@ -39,6 +40,125 @@ class FakeNotionTasksAdapter(NotionTasksAdapter):
 
     async def retrieve_data_source(self, data_source_id):
         return self.payload
+
+
+def _retry_test_adapter(responses, sleep_calls=None, **kwargs):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        response = responses[min(len(calls) - 1, len(responses) - 1)]
+        return response
+
+    async def fake_sleep(delay):
+        if sleep_calls is not None:
+            sleep_calls.append(delay)
+
+    adapter = NotionTasksAdapter(
+        token="secret_test",
+        api_version=DEFAULT_NOTION_API_VERSION,
+        base_url="https://api.notion.test",
+        transport=httpx.MockTransport(handler),
+        sleep=fake_sleep,
+        **kwargs,
+    )
+    return adapter, calls
+
+
+@pytest.mark.asyncio
+async def test_notion_adapter_retries_429_with_retry_after_then_returns_payload():
+    sleep_calls = []
+    adapter, calls = _retry_test_adapter(
+        [
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(200, json={"ok": True}),
+        ],
+        sleep_calls=sleep_calls,
+    )
+
+    payload = await adapter.retrieve_data_source(DEFAULT_TASKS_DATA_SOURCE_ID)
+
+    assert payload == {"ok": True}
+    assert len(calls) == 2
+    assert sleep_calls == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_notion_adapter_uses_default_delay_for_missing_or_invalid_retry_after():
+    missing_sleep_calls = []
+    missing_adapter, _ = _retry_test_adapter(
+        [
+            httpx.Response(429),
+            httpx.Response(200, json={"ok": True}),
+        ],
+        sleep_calls=missing_sleep_calls,
+        default_rate_limit_delay=1.25,
+    )
+
+    await missing_adapter.retrieve_data_source(DEFAULT_TASKS_DATA_SOURCE_ID)
+
+    invalid_sleep_calls = []
+    invalid_adapter, _ = _retry_test_adapter(
+        [
+            httpx.Response(429, headers={"Retry-After": "later"}),
+            httpx.Response(200, json={"ok": True}),
+        ],
+        sleep_calls=invalid_sleep_calls,
+        default_rate_limit_delay=1.5,
+    )
+
+    await invalid_adapter.retrieve_data_source(DEFAULT_TASKS_DATA_SOURCE_ID)
+
+    assert missing_sleep_calls == [1.25]
+    assert invalid_sleep_calls == [1.5]
+
+
+@pytest.mark.asyncio
+async def test_notion_adapter_clamps_retry_after_to_max_delay():
+    sleep_calls = []
+    adapter, _ = _retry_test_adapter(
+        [
+            httpx.Response(429, headers={"Retry-After": "99.5"}),
+            httpx.Response(200, json={"ok": True}),
+        ],
+        sleep_calls=sleep_calls,
+        max_rate_limit_delay=10.0,
+    )
+
+    await adapter.retrieve_data_source(DEFAULT_TASKS_DATA_SOURCE_ID)
+
+    assert sleep_calls == [10.0]
+
+
+@pytest.mark.asyncio
+async def test_notion_adapter_raises_after_rate_limit_retry_budget():
+    sleep_calls = []
+    adapter, calls = _retry_test_adapter(
+        [httpx.Response(429, headers={"Retry-After": "0"})],
+        sleep_calls=sleep_calls,
+        max_rate_limit_retries=2,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await adapter.retrieve_data_source(DEFAULT_TASKS_DATA_SOURCE_ID)
+
+    assert len(calls) == 3
+    assert sleep_calls == [0.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_notion_adapter_does_not_retry_non_429_status_errors():
+    sleep_calls = []
+    adapter, calls = _retry_test_adapter(
+        [httpx.Response(500)],
+        sleep_calls=sleep_calls,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await adapter.retrieve_data_source(DEFAULT_TASKS_DATA_SOURCE_ID)
+
+    assert len(calls) == 1
+    assert sleep_calls == []
 
 
 @pytest.mark.asyncio

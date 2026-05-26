@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -403,11 +405,21 @@ class NotionTasksAdapter:
         api_version: str = DEFAULT_NOTION_API_VERSION,
         base_url: str = "https://api.notion.com",
         timeout: float = 20.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        max_rate_limit_retries: int = 3,
+        default_rate_limit_delay: float = 1.0,
+        max_rate_limit_delay: float = 10.0,
     ):
         self.token = token
         self.api_version = api_version
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.transport = transport
+        self.sleep = sleep
+        self.max_rate_limit_retries = max_rate_limit_retries
+        self.default_rate_limit_delay = default_rate_limit_delay
+        self.max_rate_limit_delay = max_rate_limit_delay
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -416,25 +428,66 @@ class NotionTasksAdapter:
             "Content-Type": "application/json",
         }
 
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=self.timeout,
+            transport=self.transport,
+        )
+
+    def _rate_limit_delay(self, response: httpx.Response) -> float:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is None:
+            return self.default_rate_limit_delay
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            return self.default_rate_limit_delay
+        return min(max(delay, 0.0), self.max_rate_limit_delay)
+
+    async def _request(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        attempts = self.max_rate_limit_retries + 1
+        for attempt in range(attempts):
+            response = await client.request(
+                method,
+                url,
+                headers=self._headers(),
+                **kwargs,
+            )
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response
+            if attempt == attempts - 1:
+                response.raise_for_status()
+            await self.sleep(self._rate_limit_delay(response))
+
+        raise RuntimeError("unreachable Notion rate-limit retry state")
+
     async def retrieve_data_source(self, data_source_id: str) -> dict[str, Any]:
         """Retrieve a Notion data source object."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(
-                f"{self.base_url}/v1/data_sources/{data_source_id}",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "GET",
+                f"/v1/data_sources/{data_source_id}",
             )
-            response.raise_for_status()
             return response.json()
 
     async def query_tasks_by_title(self, data_source_id: str, title: str) -> list[dict[str, Any]]:
         """Query Tasks rows by exact title."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.base_url}/v1/data_sources/{data_source_id}/query",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "POST",
+                f"/v1/data_sources/{data_source_id}/query",
                 json=build_exact_title_query(title),
             )
-            response.raise_for_status()
             return response.json().get("results", [])
 
     async def query_tasks_with_apple_sync_id(
@@ -444,17 +497,17 @@ class NotionTasksAdapter:
         tasks: list[NotionTask] = []
         start_cursor: str | None = None
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with self._client() as client:
             while True:
-                response = await client.post(
-                    f"{self.base_url}/v1/data_sources/{data_source_id}/query",
-                    headers=self._headers(),
+                response = await self._request(
+                    client,
+                    "POST",
+                    f"/v1/data_sources/{data_source_id}/query",
                     json=build_apple_sync_id_query(
                         page_size=page_size,
                         start_cursor=start_cursor,
                     ),
                 )
-                response.raise_for_status()
                 payload = response.json()
                 tasks.extend(parse_notion_task(page) for page in payload.get("results", []))
                 if not payload.get("has_more"):
@@ -473,10 +526,11 @@ class NotionTasksAdapter:
         title: str = DISPOSABLE_NOTION_TO_APPLE_TITLE,
     ) -> dict[str, Any]:
         """Create the approved disposable Notion proof row."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.base_url}/v1/pages",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "POST",
+                "/v1/pages",
                 json={
                     "parent": {
                         "type": "data_source_id",
@@ -489,7 +543,6 @@ class NotionTasksAdapter:
                     ),
                 },
             )
-            response.raise_for_status()
             return response.json()
 
     async def create_apple_origin_task(
@@ -504,10 +557,11 @@ class NotionTasksAdapter:
         due_is_all_day: bool,
     ) -> dict[str, Any]:
         """Create a Notion Tasks row from an Apple reminder."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                f"{self.base_url}/v1/pages",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "POST",
+                "/v1/pages",
                 json={
                     "parent": {
                         "type": "data_source_id",
@@ -524,41 +578,40 @@ class NotionTasksAdapter:
                     ),
                 },
             )
-            response.raise_for_status()
             return response.json()
 
     async def retrieve_page(self, page_id: str) -> dict[str, Any]:
         """Retrieve a Notion page by ID."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(
-                f"{self.base_url}/v1/pages/{page_id}",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "GET",
+                f"/v1/pages/{page_id}",
             )
-            response.raise_for_status()
             return response.json()
 
     async def update_page_notes(self, page_id: str, notes: str) -> dict[str, Any]:
         """Update only the Notes property on a Notion page."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.patch(
-                f"{self.base_url}/v1/pages/{page_id}",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "PATCH",
+                f"/v1/pages/{page_id}",
                 json={"properties": build_notes_patch(notes)},
             )
-            response.raise_for_status()
             return response.json()
 
     async def update_page_apple_reminder_id(
         self, page_id: str, apple_reminder_id: str
     ) -> dict[str, Any]:
         """Update only the Apple Reminder ID property on a Notion page."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.patch(
-                f"{self.base_url}/v1/pages/{page_id}",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "PATCH",
+                f"/v1/pages/{page_id}",
                 json={"properties": build_apple_reminder_id_patch(apple_reminder_id)},
             )
-            response.raise_for_status()
             return response.json()
 
     async def update_task_from_apple(
@@ -572,10 +625,11 @@ class NotionTasksAdapter:
         due_is_all_day: bool,
     ) -> dict[str, Any]:
         """Update safe task fields on a Notion page from an Apple reminder."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.patch(
-                f"{self.base_url}/v1/pages/{page_id}",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "PATCH",
+                f"/v1/pages/{page_id}",
                 json={
                     "properties": build_task_update_from_apple_properties(
                         title=title,
@@ -587,7 +641,6 @@ class NotionTasksAdapter:
                     )
                 },
             )
-            response.raise_for_status()
             return response.json()
 
     async def update_task_proof_fields(
@@ -602,10 +655,11 @@ class NotionTasksAdapter:
         clear_due_date: bool = False,
     ) -> dict[str, Any]:
         """Update selected safe task fields for a test-slice proof run."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.patch(
-                f"{self.base_url}/v1/pages/{page_id}",
-                headers=self._headers(),
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "PATCH",
+                f"/v1/pages/{page_id}",
                 json={
                     "properties": build_task_proof_update_properties(
                         title=title,
@@ -618,7 +672,6 @@ class NotionTasksAdapter:
                     )
                 },
             )
-            response.raise_for_status()
             return response.json()
 
     async def preflight_schema(self, data_source_id: str) -> NotionSchemaReport:
