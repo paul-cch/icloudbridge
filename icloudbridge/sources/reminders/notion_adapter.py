@@ -191,6 +191,27 @@ def build_apple_sync_id_query(page_size: int = 100, start_cursor: str | None = N
     return query
 
 
+def build_unenrolled_area_query(
+    area: str,
+    page_size: int = 100,
+    start_cursor: str | None = None,
+) -> dict[str, Any]:
+    """Build a query for Notion-origin rows not yet linked to Apple."""
+    query: dict[str, Any] = {
+        "filter": {
+            "and": [
+                {"property": "Area", "select": {"equals": area}},
+                {"property": "Apple Sync ID", "rich_text": {"is_empty": True}},
+                {"property": "Apple Reminder ID", "rich_text": {"is_empty": True}},
+            ]
+        },
+        "page_size": page_size,
+    }
+    if start_cursor:
+        query["start_cursor"] = start_cursor
+    return query
+
+
 def _rich_text(content: str) -> dict[str, Any]:
     return {"rich_text": [{"text": {"content": content}}]}
 
@@ -312,6 +333,17 @@ def build_notes_patch(notes: str) -> dict[str, Any]:
 def build_apple_reminder_id_patch(apple_reminder_id: str) -> dict[str, Any]:
     """Build a Notion page property patch for the Apple Reminder ID receipt."""
     return {"Apple Reminder ID": _rich_text(apple_reminder_id)}
+
+
+def build_apple_identity_patch(
+    apple_sync_id: str,
+    apple_reminder_id: str,
+) -> dict[str, Any]:
+    """Build a Notion page property patch for both Apple identity receipts."""
+    return {
+        "Apple Sync ID": _rich_text(apple_sync_id),
+        "Apple Reminder ID": _rich_text(apple_reminder_id),
+    }
 
 
 def plain_text_from_property(prop: dict[str, Any] | None) -> str:
@@ -518,6 +550,35 @@ class NotionTasksAdapter:
 
         return tasks
 
+    async def query_unenrolled_tasks_by_area(
+        self, data_source_id: str, area: str, page_size: int = 100
+    ) -> list[NotionTask]:
+        """Read Notion-origin production rows that are not linked to Apple yet."""
+        tasks: list[NotionTask] = []
+        start_cursor: str | None = None
+
+        async with self._client() as client:
+            while True:
+                response = await self._request(
+                    client,
+                    "POST",
+                    f"/v1/data_sources/{data_source_id}/query",
+                    json=build_unenrolled_area_query(
+                        area=area,
+                        page_size=page_size,
+                        start_cursor=start_cursor,
+                    ),
+                )
+                payload = response.json()
+                tasks.extend(parse_notion_task(page) for page in payload.get("results", []))
+                if not payload.get("has_more"):
+                    break
+                start_cursor = payload.get("next_cursor")
+                if not start_cursor:
+                    break
+
+        return tasks
+
     async def create_disposable_task(
         self,
         data_source_id: str,
@@ -613,6 +674,27 @@ class NotionTasksAdapter:
                 "PATCH",
                 f"/v1/pages/{page_id}",
                 json={"properties": build_apple_reminder_id_patch(apple_reminder_id)},
+            )
+            return response.json()
+
+    async def update_page_apple_identity(
+        self,
+        page_id: str,
+        apple_sync_id: str,
+        apple_reminder_id: str,
+    ) -> dict[str, Any]:
+        """Update both Apple identity properties on a Notion page."""
+        async with self._client() as client:
+            response = await self._request(
+                client,
+                "PATCH",
+                f"/v1/pages/{page_id}",
+                json={
+                    "properties": build_apple_identity_patch(
+                        apple_sync_id=apple_sync_id,
+                        apple_reminder_id=apple_reminder_id,
+                    )
+                },
             )
             return response.json()
 

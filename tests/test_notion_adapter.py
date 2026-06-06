@@ -8,6 +8,7 @@ from icloudbridge.sources.reminders.notion_adapter import (
     DISPOSABLE_NOTION_TO_APPLE_TITLE,
     NotionTasksAdapter,
     _find_token_in_json,
+    build_apple_identity_patch,
     build_apple_origin_task_properties,
     build_apple_reminder_id_patch,
     build_apple_sync_id_query,
@@ -15,6 +16,7 @@ from icloudbridge.sources.reminders.notion_adapter import (
     build_exact_title_query,
     build_task_proof_update_properties,
     build_task_update_from_apple_properties,
+    build_unenrolled_area_query,
     parse_notion_task,
 )
 
@@ -351,6 +353,22 @@ def test_build_apple_sync_id_query_only_reads_enrolled_rows():
     }
 
 
+def test_build_unenrolled_area_query_reads_only_unlinked_area_rows():
+    query = build_unenrolled_area_query("Life", page_size=25, start_cursor="cursor")
+
+    assert query == {
+        "filter": {
+            "and": [
+                {"property": "Area", "select": {"equals": "Life"}},
+                {"property": "Apple Sync ID", "rich_text": {"is_empty": True}},
+                {"property": "Apple Reminder ID", "rich_text": {"is_empty": True}},
+            ]
+        },
+        "page_size": 25,
+        "start_cursor": "cursor",
+    }
+
+
 def test_build_apple_reminder_id_patch_updates_only_identity_receipt():
     patch = build_apple_reminder_id_patch("apple-id")
 
@@ -358,6 +376,19 @@ def test_build_apple_reminder_id_patch_updates_only_identity_receipt():
         "Apple Reminder ID": {
             "rich_text": [{"text": {"content": "apple-id"}}],
         }
+    }
+
+
+def test_build_apple_identity_patch_updates_both_identity_receipts():
+    patch = build_apple_identity_patch("apple-reminders:sync", "apple-id")
+
+    assert patch == {
+        "Apple Sync ID": {
+            "rich_text": [{"text": {"content": "apple-reminders:sync"}}],
+        },
+        "Apple Reminder ID": {
+            "rich_text": [{"text": {"content": "apple-id"}}],
+        },
     }
 
 
