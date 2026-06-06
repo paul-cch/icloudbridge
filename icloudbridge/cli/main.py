@@ -33,6 +33,7 @@ from icloudbridge.core.notion_reminders_readonly import (
     execute_deletion_grace_plan,
     execute_identity_recovery_plan,
     execute_production_baseline_plan,
+    execute_production_create_apple_plan,
     execute_production_create_notion_plan,
     execute_production_deletion_grace_plan,
     execute_production_identity_recovery_plan,
@@ -2547,6 +2548,11 @@ async def _read_notion_production_plans(
         data_source_id=data_source_id,
         page_size=notion_page_size,
     )
+    unenrolled_area_tasks = await notion.query_unenrolled_tasks_by_area(
+        data_source_id=data_source_id,
+        area=notion_area,
+        page_size=notion_page_size,
+    )
     reminders = RemindersAdapter()
     if not await reminders.request_access():
         console.print("[red]Apple Reminders access was not granted.[/red]")
@@ -2579,6 +2585,10 @@ async def _read_notion_production_plans(
         for task in notion_tasks
         if task.apple_sync_id in scoped_sync_ids or task.apple_reminder_id in apple_ids
     ]
+    scoped_page_ids = {task.page_id for task in scoped_notion_tasks}
+    scoped_notion_tasks.extend(
+        task for task in unenrolled_area_tasks if task.page_id not in scoped_page_ids
+    )
 
     match_report = build_readonly_match_report(scoped_notion_tasks, apple_reminders)
     create_plan = build_readonly_sync_plan(match_report)
@@ -2794,6 +2804,120 @@ def reminders_notion_production_create_notion(
             return True
         except Exception as exc:
             console.print(f"[red]Production create failed:[/red] {exc}")
+            return False
+
+    passed = asyncio.run(run_create())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-create-apple")
+def reminders_notion_production_create_apple(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendar: str = typer.Option(
+        ...,
+        "--apple-calendar",
+        "-a",
+        help="Allowlisted Apple Reminders production list to create into",
+    ),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+        help="Defaults to NOTION_API_TOKEN or ntn file auth",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+    expected_creates: int = typer.Option(
+        ...,
+        "--expected-creates",
+        min=0,
+        help="Exact number of CREATE_APPLE actions required before apply",
+    ),
+    max_creates: Optional[int] = typer.Option(
+        None,
+        "--max-creates",
+        min=0,
+        help="Hard cap on CREATE_APPLE actions allowed in one production run",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Actually create Apple reminders and persist Notion/SQLite identities",
+    ),
+    confirm_production: bool = typer.Option(
+        False,
+        "--confirm-production",
+        help="Required with --apply for production writes",
+    ),
+) -> None:
+    """Create Apple reminders from Notion-origin rows for one production list."""
+
+    async def run_create() -> bool:
+        if not _production_notion_area(ctx.obj["config"], apple_calendar):
+            return False
+        if not _confirm_production(apply, confirm_production):
+            return False
+
+        try:
+            context = await _read_notion_production_plans(
+                data_source_id,
+                apple_calendar,
+                notion_token,
+                api_version,
+                notion_page_size,
+                ctx.obj["config"].reminders_db_path,
+                ctx.obj["config"],
+            )
+            if context is None:
+                return False
+
+            create_plan = context["create_plan"]
+            _print_create_plan("Production Create Apple Plan", create_plan)
+            actual = create_plan.counts["CREATE_APPLE"]
+            if not _expected_count_matches("CREATE_APPLE actions", actual, expected_creates):
+                return False
+            effective_max_creates = (
+                max_creates
+                if max_creates is not None
+                else ctx.obj["config"].reminders.notion_production_create_limit
+            )
+            if actual > effective_max_creates:
+                console.print(
+                    f"[red]Refusing apply:[/red] planned {actual} CREATE_APPLE actions "
+                    f"exceeds cap {effective_max_creates}."
+                )
+                return False
+            if not apply:
+                console.print("[yellow]Dry run only. Re-run with --apply to create.[/yellow]")
+                return True
+
+            result = await execute_production_create_apple_plan(
+                create_plan,
+                apple_calendar_name=apple_calendar,
+                apple_calendar_id=context["target_calendar"].uuid,
+                reminders_adapter=context["reminders"],
+                notion_adapter=context["notion"],
+                db=context["db"],
+                max_creates=effective_max_creates,
+            )
+            result_table = Table(title="Production Create Apple Apply Result")
+            result_table.add_column("Metric", style="cyan")
+            result_table.add_column("Count", justify="right")
+            result_table.add_row("Apple reminders created", str(result.created_apple))
+            result_table.add_row(
+                "Skipped existing Apple Reminder ID",
+                str(result.skipped_existing_receipt),
+            )
+            result_table.add_row(
+                "Skipped non-CREATE_APPLE actions",
+                str(result.skipped_non_create_apple),
+            )
+            console.print(result_table)
+            return True
+        except Exception as exc:
+            console.print(f"[red]Production create Apple failed:[/red] {exc}")
             return False
 
     passed = asyncio.run(run_create())

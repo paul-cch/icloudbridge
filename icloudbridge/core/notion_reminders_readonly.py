@@ -927,6 +927,73 @@ async def execute_create_apple_plan(
     return result
 
 
+async def execute_production_create_apple_plan(
+    plan: ReadOnlySyncPlan,
+    apple_calendar_name: str,
+    apple_calendar_id: str,
+    reminders_adapter: Any,
+    notion_adapter: Any,
+    db: Any,
+    max_creates: int,
+    sync_id_factory: Any | None = None,
+) -> CreateAppleExecutionResult:
+    """Execute capped CREATE_APPLE actions for an allowlisted production list."""
+    create_actions = [action for action in plan.actions if action.kind == "CREATE_APPLE"]
+    if len(create_actions) > max_creates:
+        raise ValueError(
+            f"Refusing {len(create_actions)} CREATE_APPLE actions; cap is {max_creates}"
+        )
+
+    result = CreateAppleExecutionResult(
+        skipped_non_create_apple=len(plan.actions) - len(create_actions)
+    )
+
+    for action in create_actions:
+        task = action.notion_task
+        if task is None:
+            continue
+        if task.apple_reminder_id:
+            result.skipped_existing_receipt += 1
+            continue
+
+        apple_sync_id = (
+            task.apple_sync_id
+            or (sync_id_factory() if sync_id_factory else f"apple-reminders:{uuid4()}")
+        )
+        created = await reminders_adapter.create_reminder(
+            calendar_id=apple_calendar_id,
+            title=task.title,
+            notes=task.notes,
+            completed=task.completed,
+            priority=map_notion_priority_to_apple(task.priority),
+            due_date=task.due_date,
+            is_all_day=task.due_is_all_day,
+        )
+
+        try:
+            await notion_adapter.update_page_apple_identity(
+                task.page_id,
+                apple_sync_id=apple_sync_id,
+                apple_reminder_id=created.uuid,
+            )
+            await db.upsert_notion_reminder_mapping(
+                apple_sync_id=apple_sync_id,
+                notion_page_id=task.page_id,
+                apple_reminder_id=created.uuid,
+                apple_calendar_name=apple_calendar_name,
+                timestamp=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            raise CreateApplePartialFailure(
+                "Apple reminder was created, but Notion/SQLite identity persistence failed. "
+                "Rerun the production plan before applying again."
+            ) from exc
+
+        result.created_apple += 1
+
+    return result
+
+
 async def execute_create_notion_plan(
     plan: ReadOnlySyncPlan,
     data_source_id: str,

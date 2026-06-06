@@ -20,6 +20,7 @@ from icloudbridge.core.notion_reminders_readonly import (
     execute_deletion_grace_plan,
     execute_identity_recovery_plan,
     execute_production_baseline_plan,
+    execute_production_create_apple_plan,
     execute_production_create_notion_plan,
     execute_production_receipt_cleanup_plan,
     execute_update_apple_plan,
@@ -542,11 +543,21 @@ class FakeRemindersAdapter:
 class FakeNotionAdapter:
     def __init__(self):
         self.updated_receipts = []
+        self.updated_identities = []
         self.create_calls = []
         self.update_from_apple_calls = []
 
     async def update_page_apple_reminder_id(self, page_id, apple_reminder_id):
         self.updated_receipts.append((page_id, apple_reminder_id))
+        return {"id": page_id, "properties": {}}
+
+    async def update_page_apple_identity(
+        self,
+        page_id,
+        apple_sync_id,
+        apple_reminder_id,
+    ):
+        self.updated_identities.append((page_id, apple_sync_id, apple_reminder_id))
         return {"id": page_id, "properties": {}}
 
     async def create_apple_origin_task(self, **kwargs):
@@ -921,6 +932,81 @@ async def test_execute_create_apple_plan_skips_noop_and_create_notion_actions():
     assert result.created_apple == 0
     assert reminders.create_calls == []
     assert notion.updated_receipts == []
+
+
+@pytest.mark.asyncio
+async def test_execute_production_create_apple_plan_generates_identity_for_unenrolled_row():
+    db = FakeNotionRemindersDB()
+    reminders = FakeRemindersAdapter()
+    notion = FakeNotionAdapter()
+    report = build_readonly_match_report(
+        notion_tasks=[_notion_task("Only Notion", priority="Medium")],
+        apple_reminders=[],
+    )
+    plan = build_readonly_sync_plan(report)
+
+    result = await execute_production_create_apple_plan(
+        plan,
+        apple_calendar_name="Life",
+        apple_calendar_id="calendar-id",
+        reminders_adapter=reminders,
+        notion_adapter=notion,
+        db=db,
+        max_creates=1,
+        sync_id_factory=lambda: "apple-reminders:generated",
+    )
+
+    assert result.created_apple == 1
+    assert reminders.create_calls == [
+        {
+            "calendar_id": "calendar-id",
+            "title": "Only Notion",
+            "notes": None,
+            "completed": False,
+            "priority": 5,
+            "due_date": None,
+            "is_all_day": False,
+        }
+    ]
+    assert notion.updated_identities == [
+        ("page-Only Notion", "apple-reminders:generated", "apple-created")
+    ]
+    assert len(db.mappings) == 1
+    mapping = db.mappings[0]
+    assert mapping["apple_sync_id"] == "apple-reminders:generated"
+    assert mapping["notion_page_id"] == "page-Only Notion"
+    assert mapping["apple_reminder_id"] == "apple-created"
+    assert mapping["apple_calendar_name"] == "Life"
+
+
+@pytest.mark.asyncio
+async def test_execute_production_create_apple_plan_refuses_over_cap_before_creating():
+    db = FakeNotionRemindersDB()
+    reminders = FakeRemindersAdapter()
+    notion = FakeNotionAdapter()
+    report = build_readonly_match_report(
+        notion_tasks=[
+            _notion_task("First"),
+            _notion_task("Second"),
+        ],
+        apple_reminders=[],
+    )
+    plan = build_readonly_sync_plan(report)
+
+    with pytest.raises(ValueError, match="cap is 1"):
+        await execute_production_create_apple_plan(
+            plan,
+            apple_calendar_name="Life",
+            apple_calendar_id="calendar-id",
+            reminders_adapter=reminders,
+            notion_adapter=notion,
+            db=db,
+            max_creates=1,
+        )
+
+    assert reminders.create_calls == []
+    assert notion.updated_identities == []
+    assert db.mappings == []
 
 
 @pytest.mark.asyncio
