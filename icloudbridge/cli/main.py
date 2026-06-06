@@ -97,6 +97,9 @@ _PRODUCTION_STATUS_COLUMNS = (
     ("error", "Error", "red", None),
 )
 
+_NOTION_SYNC_TEST_LIST = "Notion Sync Test"
+_NOTION_SYNC_TEST_TITLE_PREFIX = "[SYNC TEST]"
+
 
 @app.callback()
 def main(
@@ -1465,6 +1468,12 @@ def reminders_notion_readonly(
                 )
                 return False
             apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+            notion_tasks, apple_reminders, _ = _scope_test_slice_inputs(
+                notion_tasks,
+                apple_reminders,
+                [],
+                apple_calendar,
+            )
         except Exception as exc:
             console.print(f"[red]Apple read-only proof failed:[/red] {exc}")
             return False
@@ -1619,6 +1628,12 @@ def reminders_notion_plan(
                 )
                 return False
             apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+            notion_tasks, apple_reminders, _ = _scope_test_slice_inputs(
+                notion_tasks,
+                apple_reminders,
+                [],
+                apple_calendar,
+            )
         except Exception as exc:
             console.print(f"[red]Apple planning read failed:[/red] {exc}")
             return False
@@ -1767,6 +1782,12 @@ def reminders_notion_create_apple(
             return None, None
 
         apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+        notion_tasks, apple_reminders, _ = _scope_test_slice_inputs(
+            notion_tasks,
+            apple_reminders,
+            [],
+            apple_calendar,
+        )
         match_report = build_readonly_match_report(notion_tasks, apple_reminders)
         return target_calendar, build_readonly_sync_plan(match_report)
 
@@ -1964,6 +1985,12 @@ def reminders_notion_create_notion(
             return None
 
         apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
+        notion_tasks, apple_reminders, _ = _scope_test_slice_inputs(
+            notion_tasks,
+            apple_reminders,
+            [],
+            apple_calendar,
+        )
         match_report = build_readonly_match_report(notion_tasks, apple_reminders)
         return build_readonly_sync_plan(match_report)
 
@@ -2214,6 +2241,62 @@ def _expected_count_matches(kind: str, actual: int, expected: int) -> bool:
     return True
 
 
+def _is_notion_sync_test_title(title: str | None) -> bool:
+    return bool(title and title.startswith(_NOTION_SYNC_TEST_TITLE_PREFIX))
+
+
+def _scope_notion_tasks_for_apple_calendar(
+    notion_tasks: list[Any],
+    apple_calendar: str,
+) -> list[Any]:
+    if apple_calendar != _NOTION_SYNC_TEST_LIST:
+        return notion_tasks
+    return [
+        task
+        for task in notion_tasks
+        if _is_notion_sync_test_title(getattr(task, "title", None))
+    ]
+
+
+def _scope_apple_reminders_for_apple_calendar(
+    apple_reminders: list[Any],
+    apple_calendar: str,
+) -> list[Any]:
+    if apple_calendar != _NOTION_SYNC_TEST_LIST:
+        return apple_reminders
+    return [
+        reminder
+        for reminder in apple_reminders
+        if _is_notion_sync_test_title(getattr(reminder, "title", None))
+    ]
+
+
+def _scope_mappings_for_apple_calendar(
+    mappings: list[dict[str, Any]],
+    apple_calendar: str,
+) -> list[dict[str, Any]]:
+    if apple_calendar != _NOTION_SYNC_TEST_LIST:
+        return mappings
+    return [
+        mapping
+        for mapping in mappings
+        if mapping.get("apple_calendar_name") == _NOTION_SYNC_TEST_LIST
+    ]
+
+
+def _scope_test_slice_inputs(
+    notion_tasks: list[Any],
+    apple_reminders: list[Any],
+    mappings: list[dict[str, Any]],
+    apple_calendar: str,
+) -> tuple[list[Any], list[Any], list[dict[str, Any]]]:
+    return (
+        _scope_notion_tasks_for_apple_calendar(notion_tasks, apple_calendar),
+        _scope_apple_reminders_for_apple_calendar(apple_reminders, apple_calendar),
+        _scope_mappings_for_apple_calendar(mappings, apple_calendar),
+    )
+
+
 def _production_status_targets(config: Any, apple_calendars: list[str] | None) -> list[str]:
     if not apple_calendars:
         return list(config.reminders.notion_area_mappings)
@@ -2322,10 +2405,16 @@ async def _read_notion_update_plan(
         return None, None, None, None
 
     apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
-    match_report = build_readonly_match_report(notion_tasks, apple_reminders)
     db = NotionRemindersDB(db_path)
     await db.initialize()
     mappings = await db.get_all_notion_reminder_mappings()
+    notion_tasks, apple_reminders, mappings = _scope_test_slice_inputs(
+        notion_tasks,
+        apple_reminders,
+        mappings,
+        apple_calendar,
+    )
+    match_report = build_readonly_match_report(notion_tasks, apple_reminders)
     update_plan = build_bidirectional_update_plan(match_report, mappings)
     return update_plan, notion, reminders, db
 
@@ -2367,6 +2456,12 @@ async def _read_notion_identity_recovery_plan(
     db = NotionRemindersDB(db_path)
     await db.initialize()
     mappings = await db.get_all_notion_reminder_mappings()
+    notion_tasks, apple_reminders, mappings = _scope_test_slice_inputs(
+        notion_tasks,
+        apple_reminders,
+        mappings,
+        apple_calendar,
+    )
     recovery_plan = build_identity_recovery_plan(notion_tasks, apple_reminders, mappings)
     return recovery_plan, notion, reminders, db
 
@@ -2408,6 +2503,12 @@ async def _read_notion_deletion_grace_plan(
     db = NotionRemindersDB(db_path)
     await db.initialize()
     mappings = await db.get_all_notion_reminder_mappings()
+    notion_tasks, apple_reminders, mappings = _scope_test_slice_inputs(
+        notion_tasks,
+        apple_reminders,
+        mappings,
+        apple_calendar,
+    )
     grace_plan = build_deletion_grace_plan(notion_tasks, apple_reminders, mappings)
     return grace_plan, notion, reminders, db, notion_tasks, apple_reminders, mappings
 
