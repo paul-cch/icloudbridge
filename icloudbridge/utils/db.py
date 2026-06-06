@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import aiosqlite
 
@@ -687,6 +688,18 @@ class NotionRemindersDB:
     async def get_all_notion_reminder_mappings(self) -> list[dict]:
         """Get all Notion reminder mappings."""
         async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM notion_reminder_mapping") as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_all_notion_reminder_mappings_readonly(self) -> list[dict]:
+        """Get all Notion reminder mappings without creating or migrating the DB."""
+        if not self.db_path.exists():
+            raise FileNotFoundError(f"Notion reminders database not found: {self.db_path}")
+
+        db_uri = f"file:{quote(str(self.db_path), safe='/')}?mode=ro"
+        async with aiosqlite.connect(db_uri, uri=True) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM notion_reminder_mapping") as cursor:
                 rows = await cursor.fetchall()
