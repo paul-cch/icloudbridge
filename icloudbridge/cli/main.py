@@ -5,7 +5,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import httpx
 import typer
@@ -74,6 +74,28 @@ app = typer.Typer(
 
 # Create console for rich output
 console = Console()
+
+_PRODUCTION_STATUS_COLUMNS = (
+    ("apple_calendar", "Apple List", "cyan", None),
+    ("notion_area", "Notion Area", "green", None),
+    ("status", "Status", "bold", None),
+    ("create_noop", "Create NOOP", None, "right"),
+    ("create_apple", "Create Apple", None, "right"),
+    ("create_notion", "Create Notion", None, "right"),
+    ("needs_baseline", "Baseline", None, "right"),
+    ("update_apple", "Update Apple", None, "right"),
+    ("update_notion", "Update Notion", None, "right"),
+    ("conflict", "Conflict", None, "right"),
+    ("recover_apple_id", "Recover ID", None, "right"),
+    ("unrecovered", "Unrecovered", None, "right"),
+    ("missing_apple_first_seen", "Missing Apple First", None, "right"),
+    ("missing_apple_still_missing", "Missing Apple Still", None, "right"),
+    ("missing_notion_first_seen", "Missing Notion First", None, "right"),
+    ("missing_notion_still_missing", "Missing Notion Still", None, "right"),
+    ("marker_writes", "Marker Writes", None, "right"),
+    ("untracked", "Untracked", None, "right"),
+    ("error", "Error", "red", None),
+)
 
 
 @app.callback()
@@ -2192,6 +2214,80 @@ def _expected_count_matches(kind: str, actual: int, expected: int) -> bool:
     return True
 
 
+def _production_status_targets(config: Any, apple_calendars: list[str] | None) -> list[str]:
+    if not apple_calendars:
+        return list(config.reminders.notion_area_mappings)
+
+    targets: list[str] = []
+    seen: set[str] = set()
+    for calendar in apple_calendars:
+        if calendar in seen:
+            continue
+        seen.add(calendar)
+        targets.append(calendar)
+    return targets
+
+
+def _production_status_row(apple_calendar: str, context: dict[str, Any]) -> dict[str, Any]:
+    create_counts = context["create_plan"].counts
+    update_counts = context["update_plan"].counts
+    recovery_counts = context["recovery_plan"].counts
+    grace_counts = context["grace_plan"].counts
+    return {
+        "apple_calendar": apple_calendar,
+        "notion_area": context["area"],
+        "status": "OK",
+        "create_noop": create_counts["NOOP"],
+        "create_apple": create_counts["CREATE_APPLE"],
+        "create_notion": create_counts["CREATE_NOTION"],
+        "needs_baseline": update_counts["NEEDS_BASELINE"],
+        "update_apple": update_counts["UPDATE_APPLE"],
+        "update_notion": update_counts["UPDATE_NOTION"],
+        "conflict": update_counts["CONFLICT"],
+        "recover_apple_id": recovery_counts["RECOVER_APPLE_ID"],
+        "unrecovered": recovery_counts["UNRECOVERED"],
+        "missing_apple_first_seen": grace_counts["MISSING_APPLE_FIRST_SEEN"],
+        "missing_apple_still_missing": grace_counts["MISSING_APPLE_STILL_MISSING"],
+        "missing_notion_first_seen": grace_counts["MISSING_NOTION_FIRST_SEEN"],
+        "missing_notion_still_missing": grace_counts["MISSING_NOTION_STILL_MISSING"],
+        "marker_writes": (
+            grace_counts["MISSING_APPLE_FIRST_SEEN"]
+            + grace_counts["MISSING_NOTION_FIRST_SEEN"]
+        ),
+        "untracked": grace_counts["UNTRACKED"],
+        "error": "",
+    }
+
+
+def _production_status_failure_row(
+    apple_calendar: str,
+    error: str,
+) -> dict[str, Any]:
+    row = {key: "" for key, _, _, _ in _PRODUCTION_STATUS_COLUMNS}
+    row.update(
+        {
+            "apple_calendar": apple_calendar,
+            "status": "FAILED",
+            "error": error,
+        }
+    )
+    return row
+
+
+def _print_production_status(rows: list[dict[str, Any]]) -> None:
+    table = Table(title="Production Notion Reminders Status")
+    for _, label, style, justify in _PRODUCTION_STATUS_COLUMNS:
+        column_args = {}
+        if style:
+            column_args["style"] = style
+        if justify:
+            column_args["justify"] = justify
+        table.add_column(label, **column_args)
+    for row in rows:
+        table.add_row(*(str(row[key]) for key, _, _, _ in _PRODUCTION_STATUS_COLUMNS))
+    console.print(table)
+
+
 async def _read_notion_update_plan(
     data_source_id: str,
     apple_calendar: str,
@@ -2324,6 +2420,7 @@ async def _read_notion_production_plans(
     notion_page_size: int,
     db_path: Path,
     config,
+    initialize_receipts: bool = True,
 ):
     from icloudbridge.sources.reminders.eventkit import RemindersAdapter
     from icloudbridge.utils.db import NotionRemindersDB
@@ -2363,8 +2460,11 @@ async def _read_notion_production_plans(
     apple_reminders = await reminders.get_reminders(calendar_id=target_calendar.uuid)
     apple_ids = {getattr(reminder, "uuid", "") for reminder in apple_reminders}
     db = NotionRemindersDB(db_path)
-    await db.initialize()
-    mappings = await db.get_all_notion_reminder_mappings()
+    if initialize_receipts:
+        await db.initialize()
+        mappings = await db.get_all_notion_reminder_mappings()
+    else:
+        mappings = await db.get_all_notion_reminder_mappings_readonly()
     scoped_mappings = [
         mapping
         for mapping in mappings
@@ -2455,6 +2555,70 @@ def reminders_notion_production_plan(
         return True
 
     passed = asyncio.run(run_production_plan())
+    if not passed:
+        raise typer.Exit(1)
+
+
+@reminders_app.command("notion-production-status")
+def reminders_notion_production_status(
+    ctx: typer.Context,
+    data_source_id: str = typer.Option(DEFAULT_TASKS_DATA_SOURCE_ID, "--data-source-id"),
+    apple_calendars: Optional[list[str]] = typer.Option(
+        None,
+        "--apple-calendar",
+        "-a",
+        help="Allowlisted Apple Reminders list to inspect; repeat to inspect several.",
+    ),
+    notion_token: Optional[str] = typer.Option(
+        None,
+        "--notion-token",
+        envvar="NOTION_API_TOKEN",
+    ),
+    api_version: str = typer.Option(DEFAULT_NOTION_API_VERSION, "--notion-version"),
+    notion_page_size: int = typer.Option(100, "--notion-page-size", min=1, max=100),
+) -> None:
+    """Summarize allowlisted production Notion Tasks ↔ Apple Reminders plans."""
+
+    async def run_production_status() -> bool:
+        targets = _production_status_targets(ctx.obj["config"], apple_calendars)
+        if not targets:
+            console.print("[red]No production Notion Area mappings are configured.[/red]")
+            return False
+
+        rows: list[dict[str, Any]] = []
+        passed = True
+        for apple_calendar in targets:
+            try:
+                context = await _read_notion_production_plans(
+                    data_source_id,
+                    apple_calendar,
+                    notion_token,
+                    api_version,
+                    notion_page_size,
+                    ctx.obj["config"].reminders_db_path,
+                    ctx.obj["config"],
+                    initialize_receipts=False,
+                )
+            except Exception as exc:
+                rows.append(_production_status_failure_row(apple_calendar, str(exc)))
+                passed = False
+                continue
+            if context is None:
+                rows.append(
+                    _production_status_failure_row(
+                        apple_calendar,
+                        "production plan unavailable",
+                    )
+                )
+                passed = False
+                continue
+            rows.append(_production_status_row(apple_calendar, context))
+
+        _print_production_status(rows)
+        console.print("\n[green]No writes attempted.[/green]")
+        return passed
+
+    passed = asyncio.run(run_production_status())
     if not passed:
         raise typer.Exit(1)
 

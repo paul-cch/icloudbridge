@@ -548,6 +548,7 @@ Production enablement is now implemented as an explicit, allowlisted pilot path:
 - Allowed Apple list to Notion Area mappings live in app config as `reminders.notion_area_mappings`.
 - Initial mappings: `Life -> Life`, `Dissertation -> Dissertation`, and `Academic -> Academic`.
 - Production commands are separate from the `Notion Sync Test` milestone commands and do not weaken the test-slice guards.
+- Production status is read-only via `icloudbridge reminders notion-production-status`; run it first to summarize all allowlisted lists, or pass repeated `--apple-calendar` filters to inspect specific lists.
 - Production applies require exact allowlisted list names, explicit `--apply`, explicit `--confirm-production`, expected action counts, and capped writes.
 - First production create cap defaults to 5 Apple-to-Notion rows.
 - Production baselines are explicit via `icloudbridge reminders notion-production-baseline`; they write snapshot baselines only for `NEEDS_BASELINE` rows and refuse while Apple-to-Notion creates are pending.
